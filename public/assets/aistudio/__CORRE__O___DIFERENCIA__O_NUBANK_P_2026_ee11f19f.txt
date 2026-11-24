@@ -1,0 +1,108 @@
+# CORREÇÃO — DIFERENCIAÇÃO NUBANK PF E NUBANK PJ
+## SAVIO FINANCE IA
+
+Analisar e implementar a diferenciação entre contas Nubank Pessoa Física e Nubank Pessoa Jurídica nos seguintes arquivos:
+
+- banksRepository.ts
+- accountIdentifier.ts
+- institutionRegistry.ts
+- csvParser.ts
+- ofxParser.ts
+- pdfAndImageParser.ts
+
+### 1. INSTITUIÇÃO BANCÁRIA
+
+Manter uma única instituição financeira:
+
+- Nome: Nubank / Nu Pagamentos.
+- Código COMPE: 260.
+- ISPB: 18236120.
+- Agência padrão: 0001, quando confirmada no extrato.
+
+Não criar códigos bancários fictícios ou diferentes para PF e PJ.
+
+### 2. PERFIS DE IDENTIFICAÇÃO
+
+Criar os seguintes identificadores internos:
+
+- nubank_pf: Nubank Pessoa Física.
+- nubank_pj: Nubank Empresas / Pessoa Jurídica.
+
+Ambos devem permanecer vinculados à instituição Nubank.
+
+### 3. IDENTIFICAÇÃO DA TITULARIDADE
+
+Nubank PF:
+- CPF do titular.
+- Tipo de conta pessoal.
+- Associação com entidade PF.
+
+Nubank PJ:
+- CNPJ do titular.
+- Razão social ou nome empresarial, quando disponível.
+- Tipo de conta empresarial.
+- Associação com entidade PJ.
+
+### 4. RECONHECIMENTO DOS EXTRATOS
+
+Reconhecer variações de nomenclatura:
+
+- Nubank.
+- Nu Pagamentos.
+- NuConta.
+- Nubank PF.
+- Nubank Pessoa Física.
+- Nubank Empresas.
+- Nu Empresas.
+- Nubank PJ.
+- Nubank Pessoa Jurídica.
+
+Não utilizar somente o nome do arquivo como prova de titularidade.
+
+### 5. ASSOCIAÇÃO AUTOMÁTICA
+
+Comparar:
+- Código bancário.
+- ISPB.
+- CPF/CNPJ validado.
+- Agência.
+- Número da conta.
+- Conta cadastrada no sistema.
+- Titularidade da entidade.
+
+Se CPF coincidir com uma conta PF cadastrada, associar à conta PF.
+
+Se CNPJ coincidir com uma conta PJ cadastrada, associar à conta PJ.
+
+Se existirem contas concorrentes ou informações insuficientes, solicitar confirmação.
+
+### 6. IMPORTAÇÃO
+
+Aplicar a diferenciação nos arquivos CSV, OFX, PDF e XLSX, preservando os identificadores originais das movimentações.
+
+Corrigir especialmente o leitor CSV do Nubank para extrair metadados de titularidade e conta quando disponíveis, sem assumir que todos os arquivos contêm essas informações.
+
+### 7. TESTES
+
+Criar testes para:
+
+- Extrato Nubank PF.
+- Extrato Nubank PJ.
+- Duas contas Nubank com mesmo código bancário.
+- CPF e CNPJ divergentes.
+- Arquivo sem identificação de titularidade.
+- Contas com últimos quatro dígitos iguais.
+- Transferência entre Nubank PF e Nubank PJ.
+
+### 8. RESULTADO
+
+Na importação, apresentar claramente:
+
+Instituição: Nubank
+Perfil: Pessoa Física ou Pessoa Jurídica
+Titularidade: CPF ou CNPJ
+Agência: 0001, quando confirmada
+Conta: número identificado
+Conta cadastrada: conta correspondente no SAVIO FINANCE IA
+
+Preservar a estrutura existente, os dados financeiros e a compatibilidade com os demais bancos.

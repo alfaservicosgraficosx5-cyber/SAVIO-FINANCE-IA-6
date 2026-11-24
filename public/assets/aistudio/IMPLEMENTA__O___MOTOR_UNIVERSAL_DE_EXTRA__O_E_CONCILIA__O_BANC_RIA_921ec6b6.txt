@@ -1,0 +1,159 @@
+# IMPLEMENTAÇÃO — MOTOR UNIVERSAL DE EXTRAÇÃO E CONCILIAÇÃO BANCÁRIA
+## Projeto SAVIO FINANCE IA
+
+Realize uma auditoria e evolução do módulo de importação de extratos do SAVIO FINANCE IA, utilizando como referência funcional o extrator Python `extrato.py`, fornecido pelo usuário.
+
+### 1. OBJETIVO
+
+Integrar as regras específicas de leitura bancária do extrator ao motor atual do sistema, mantendo uma única arquitetura de processamento para PDF, OFX, CSV, XLSX e OCR.
+
+Não criar outro sistema isolado. Não substituir funcionalidades existentes sem analisar suas dependências.
+
+### 2. BANCOS E FORMATOS
+
+Implementar perfis específicos para:
+
+- Rico — CSV.
+- Nubank — CSV.
+- Inter — CSV.
+- Banco do Brasil — XLSX.
+- 99Pay — XLSX.
+
+Preservar também os leitores atuais de PDF, OFX e demais formatos existentes.
+
+A identificação deve considerar cabeçalhos, estrutura de colunas, instituição, agência, conta, titularidade e indicadores específicos do arquivo.
+
+### 3. NORMALIZAÇÃO
+
+Criar um modelo financeiro padronizado contendo:
+
+- ID interno.
+- ID original bancário.
+- Instituição financeira.
+- Conta de origem.
+- CPF/CNPJ ou titularidade associada, sem exposição desnecessária.
+- Data da operação.
+- Data de compensação.
+- Descrição original.
+- Descrição normalizada.
+- Valor original.
+- Valor normalizado.
+- Direção: entrada ou saída.
+- Natureza financeira.
+- Categoria e subcategoria.
+- Formato e arquivo de origem.
+- Confiança da identificação.
+- Status da conferência.
+
+Preservar os valores em precisão decimal exata, preferencialmente em centavos inteiros quando aplicável.
+
+### 4. CLASSIFICAÇÃO FINANCEIRA
+
+Separar direção, natureza e categoria.
+
+Reconhecer:
+
+- Receitas.
+- Despesas.
+- PIX recebido e enviado.
+- Transferências entre contas próprias.
+- Aportes PF/PJ.
+- Retiradas de sócios.
+- Pagamentos de boletos.
+- Pagamentos de faturas.
+- Cashback.
+- Rendimentos.
+- Dividendos e JCP.
+- Aplicações financeiras.
+- Resgates.
+- Estornos.
+- Tarifas e juros.
+
+Aplicações e resgates não devem ser confundidos com despesas e receitas operacionais.
+
+Não classificar operações somente por palavras-chave quando houver informações suficientes para uma interpretação mais precisa.
+
+### 5. CONCILIAÇÃO
+
+Implementar:
+
+- Identificação de transações duplicadas.
+- Preservação de FITID e IDs originais.
+- Detecção de possíveis transferências entre contas próprias.
+- Comparação de saldo inicial e final.
+- Conferência de entradas e saídas.
+- Identificação de movimentações sem classificação.
+- Tratamento de estornos e operações pendentes.
+
+Nunca excluir automaticamente transações apenas por possuírem valores, datas e descrições semelhantes.
+
+### 6. SOMATÓRIOS
+
+Apresentar:
+
+- Total de entradas.
+- Total de saídas.
+- Resultado líquido.
+- Receitas operacionais.
+- Despesas operacionais.
+- Transferências internas.
+- Aplicações e resgates.
+- Rendimentos financeiros.
+- Cashback.
+- Quantidade de movimentações.
+- Saldo inicial.
+- Saldo final informado pelo banco.
+- Saldo final calculado.
+- Diferença de conciliação.
+
+Disponibilizar consolidação por conta, instituição, PF, PJ, dia, mês e ano.
+
+Não duplicar transferências próprias no resultado consolidado.
+
+### 7. INTERFACE
+
+Na tela de importação, apresentar uma prévia antes de salvar.
+
+Exibir a instituição identificada, conta associada, titularidade, período do extrato, quantidade de lançamentos, entradas, saídas, transferências e saldo conciliado.
+
+Permitir corrigir manualmente instituição, conta, direção, natureza e categoria.
+
+Apresentar alertas para operações com baixa confiança ou inconsistências.
+
+### 8. APRENDIZADO
+
+Permitir salvar regras de classificação corrigidas pelo usuário, associadas ao banco, conta e histórico da movimentação.
+
+Reutilizar regras em importações futuras, solicitando confirmação quando houver ambiguidade.
+
+### 9. TESTES OBRIGATÓRIOS
+
+Criar testes unitários e de integração para todos os cinco perfis bancários e para PDF e OFX.
+
+Testar valores brasileiros, datas, células Excel datetime, arquivos com cabeçalhos alternativos, transferências, aplicações, resgates, estornos e duplicidades.
+
+Comparar os totais calculados com os saldos reais dos extratos.
+
+### 10. RESTRIÇÕES
+
+- Não apagar dados financeiros existentes.
+- Não alterar o modelo de contas sem migração compatível.
+- Não criar lançamentos definitivos durante a prévia.
+- Não duplicar os serviços de importação.
+- Não substituir parsers funcionais sem testes de regressão.
+- Não presumir instituição ou conta quando houver ambiguidade.
+- Não considerar aplicações como despesas de consumo.
+- Não considerar transferências internas como receita ou despesa consolidada.
+
+### 11. ENTREGA
+
+Apresentar:
+1. Diagnóstico dos arquivos existentes.
+2. Plano de integração.
+3. Arquivos modificados e novos.
+4. Testes executados e resultados.
+5. Exemplos de importação por banco.
+6. Relatório de conciliação.
+7. Garantia de compatibilidade com os módulos PF, PJ e cartões.
+
+Implementar em etapas, preservando a arquitetura e os dados atuais do SAVIO FINANCE IA.
