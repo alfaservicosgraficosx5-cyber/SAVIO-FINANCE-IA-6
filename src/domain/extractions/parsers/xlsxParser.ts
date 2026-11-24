@@ -11,6 +11,7 @@ import {
   parseFlexibleDate,
   parseFlexibleSignedAmount,
 } from './csvParser';
+import { normalizeTransactionIdToken } from './tabularPrimitives';
 import { sanitizeCellForSheet } from '../../../utils/sheetGuard';
 import { detectBankFromStatement } from '../banksRepository';
 import {
@@ -312,7 +313,9 @@ export function parseSpreadsheetStatement(
       currency: 'BRL',
       bankTransactionId:
         mapping.idCol !== undefined
-          ? sanitizeExtractedText(String(rowArr[mapping.idCol] ?? ''), 100) || undefined
+          ? normalizeTransactionIdToken(
+              sanitizeExtractedText(String(rowArr[mapping.idCol] ?? ''), 100)
+            )
           : undefined,
       counterparty:
         mapping.counterpartyCol !== undefined

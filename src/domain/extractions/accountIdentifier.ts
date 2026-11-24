@@ -31,15 +31,16 @@ function normalizeCompeCodeLocal(code?: string): string {
 function normalizeAgencyTokens(raw?: string): { alnum: string; base4: string } {
   const cleaned = String(raw || '').trim().toLowerCase();
   const alnum = cleaned.replace(/[^0-9x]/g, '');
-  const onlyDigits = digitsOnly(cleaned);
+  const stripped = alnum.replace(/^0+(?=\d{4,5}x?$)/, '');
+  const onlyDigits = digitsOnly(stripped);
   // BB agencies are 4 base digits + optional 1 check digit (-5 or -X); keep 4-digit base when 5 chars
   const base4 =
-    alnum.length === 5
-      ? alnum.slice(0, 4)
+    stripped.length === 5
+      ? stripped.slice(0, 4)
       : onlyDigits.length === 5
         ? onlyDigits.slice(0, 4)
-        : alnum;
-  return { alnum, base4 };
+        : stripped || alnum;
+  return { alnum: stripped || alnum, base4 };
 }
 
 function agenciesCompatible(a?: string, b?: string): boolean {
@@ -50,13 +51,14 @@ function agenciesCompatible(a?: string, b?: string): boolean {
   const stripA = tokA.alnum.replace(/^0+/, '');
   const stripB = tokB.alnum.replace(/^0+/, '');
   if (stripA && stripA === stripB) return true;
-  // Base 4-digit match (e.g. "1234" vs "1234-5" or "1234-X")
+  // Base 4-digit match (e.g. "1234" vs "1234-5" or "1234-X" or "000012345")
   if (tokA.base4.length === 4 && tokA.base4 === tokB.base4) return true;
   return false;
 }
 
 function normalizeAccountComparable(raw?: string): {
   digits: string;
+  digitsStripped: string;
   alnum: string;
   stripped: string;
   last4: string;
@@ -64,9 +66,10 @@ function normalizeAccountComparable(raw?: string): {
   const cleaned = String(raw || '').trim().toLowerCase();
   const alnum = cleaned.replace(/[^0-9x]/g, '');
   const digits = digitsOnly(cleaned);
+  const digitsStripped = digits.replace(/^0+/, '') || digits;
   const stripped = (alnum || digits).replace(/^0+/, '') || digits;
   const last4 = digits.slice(-4) || alnum.slice(-4);
-  return { digits, alnum, stripped, last4 };
+  return { digits, digitsStripped, alnum, stripped, last4 };
 }
 
 function extractFallbackAccountNumberFromName(accountName?: string): string {
@@ -205,7 +208,9 @@ export function identifySourceAccount(params: {
         Boolean(
           extractedComp.stripped.length >= 4 &&
             isExtFull &&
-            (extractedComp.digits === extComp.digits || extractedComp.stripped === extComp.stripped)
+            (extractedComp.digits === extComp.digits ||
+              extractedComp.digitsStripped === extComp.digitsStripped ||
+              extractedComp.stripped === extComp.stripped)
         );
       const sameLast4 = Boolean(
         accountLast4.length === 4 && extComp.last4.length === 4 && accountLast4 === extComp.last4
