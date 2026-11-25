@@ -138,7 +138,7 @@ service cloud.firestore {
           'reversalTransactionId', 'cancelledAt', 'cancellationReason',
           'purchaseDate', 'postingDate', 'billingCycleYm', 'billingClosingDate',
           'billingDueDate', 'cardEntryKind', 'installmentGroupId',
-          'revision', 'createdAt', 'updatedAt'
+          'import_hash', 'revision', 'createdAt', 'updatedAt'
         ])
         && hasValidBaseEntity(data, uid, txId)
         && isEntityScopePair(data.entityId)
@@ -187,7 +187,8 @@ service cloud.firestore {
         && isOptionalBoundedStr(data, 'billingClosingDate', 32)
         && isOptionalBoundedStr(data, 'billingDueDate', 32)
         && isOptionalBoundedStr(data, 'cardEntryKind', 32)
-        && isOptionalBoundedStr(data, 'installmentGroupId', 128);
+        && isOptionalBoundedStr(data, 'installmentGroupId', 128)
+        && isOptionalBoundedStr(data, 'import_hash', 128);
     }
 
     function isValidCreditCard(data, uid, cardId) {
@@ -350,11 +351,16 @@ service cloud.firestore {
           'id', 'ownerUid', 'keyword', 'category', 'createdAt', 'updatedAt'
         ])
         && data.keys().hasOnly([
-          'id', 'ownerUid', 'keyword', 'category', 'direction', 'revision', 'createdAt', 'updatedAt'
+          'id', 'ownerUid', 'keyword', 'category', 'category_id', 'profile',
+          'entityId', 'card_id', 'direction', 'revision', 'createdAt', 'updatedAt'
         ])
         && hasValidBaseEntity(data, uid, ruleId)
         && isBoundedStr(data.keyword, 1, 120)
         && isBoundedStr(data.category, 1, 120)
+        && isOptionalBoundedStr(data, 'category_id', 120)
+        && (!('profile' in data) || isEntityScopePair(data.profile))
+        && (!('entityId' in data) || isEntityScopePair(data.entityId))
+        && isOptionalBoundedStr(data, 'card_id', 128)
         && (!('direction' in data) || data.direction in ['INCOME', 'EXPENSE']);
     }
 

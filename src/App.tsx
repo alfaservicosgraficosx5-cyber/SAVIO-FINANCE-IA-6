@@ -1619,16 +1619,42 @@ export default function App() {
   const handleAddCategoryRule = (rule: Omit<CategoryRule, 'id' | 'createdAt'>) => {
     const created: CategoryRule = {
       ...rule,
+      category_id: rule.category_id || rule.category,
       id: generateEntityId('rule'),
       createdAt: new Date().toISOString(),
     };
-    setCategoryRules((prev) => [created, ...prev]);
+    const nextRules = [created, ...categoryRules];
+    setCategoryRules(nextRules);
+    void commitAtomicMutationBatch({ categoryRules: nextRules });
     setFeedbackBanner(`Regra "${rule.keyword}" → ${rule.category} adicionada.`);
     setTimeout(() => setFeedbackBanner(null), 3500);
   };
 
+  const handleUpsertCategoryRules = (learnedRules: CategoryRule[]) => {
+    if (!learnedRules || learnedRules.length === 0) return;
+    setCategoryRules((prev) => {
+      const merged = [...prev];
+      for (const incoming of learnedRules) {
+        const normKw = incoming.keyword.trim().toLowerCase();
+        const cardKey = incoming.card_id || '';
+        const idx = merged.findIndex(
+          (r) => r.keyword.trim().toLowerCase() === normKw && (r.card_id || '') === cardKey
+        );
+        if (idx >= 0) {
+          merged[idx] = { ...merged[idx], ...incoming, id: merged[idx].id };
+        } else {
+          merged.unshift(incoming);
+        }
+      }
+      void commitAtomicMutationBatch({ categoryRules: merged });
+      return merged;
+    });
+  };
+
   const handleDeleteCategoryRule = (id: string) => {
-    setCategoryRules((prev) => prev.filter((r) => r.id !== id));
+    const nextRules = categoryRules.filter((r) => r.id !== id);
+    setCategoryRules(nextRules);
+    void commitAtomicMutationBatch({ categoryRules: nextRules });
   };
 
   const handleSaveInstitution = (inst: InstitutionProfile) => {
@@ -2019,17 +2045,22 @@ export default function App() {
         }
       }
       if (deltaCents !== 0) {
-        setCreditCards((prev) =>
-          prev.map((c) => {
+        setCreditCards((prev) => {
+          const nextCards = prev.map((c) => {
             if (c.id !== meta.cardId) return c;
-            const nextCents = Math.max(0, (toCents(c.currentInvoiceAmount) as number) + deltaCents);
+            const nextCents = Math.max(
+              0,
+              (toCents(c.currentInvoiceAmount) as number) + deltaCents
+            );
             return {
               ...c,
               currentInvoiceAmount: fromCents(cents(nextCents)),
-              status: nextCents === 0 ? 'PAID' : 'OPEN',
+              status: (nextCents === 0 ? 'PAID' : 'OPEN') as CreditCard['status'],
             };
-          })
-        );
+          });
+          void commitAtomicMutationBatch({ creditCards: nextCards });
+          return nextCards;
+        });
       }
     }
     return res;
@@ -2044,8 +2075,12 @@ export default function App() {
       typeof paidAmount === 'number' && Number.isFinite(paidAmount) && paidAmount > 0
         ? toCents(paidAmount)
         : invoiceCents;
-    const amountToPayCents = cents(Math.min(invoiceCents, requestedCents));
-    const remainingCents = subtractMoney(invoiceCents, amountToPayCents);
+    const amountToPayCents =
+      invoiceCents > 0 ? cents(Math.min(invoiceCents, requestedCents)) : requestedCents;
+    const remainingCents =
+      invoiceCents > 0
+        ? cents(Math.max(0, (invoiceCents as number) - (amountToPayCents as number)))
+        : cents(0);
 
     const nextCards = creditCards.map((c) =>
       c.id === cardId
@@ -2063,7 +2098,7 @@ export default function App() {
       if (acc) {
         const newTx: Transaction = {
           id: generateEntityId('tr'),
-          entityId: card.entityId,
+          entityId: acc.entityId || card.entityId,
           accountId: acc.id,
           creditCardId: card.id,
           date: todayLocal(),
@@ -2079,6 +2114,7 @@ export default function App() {
           status: 'CONFIRMED',
           origin: 'MANUAL',
           isCardBillPayment: true,
+          isInternalTransfer: true,
           operationType: 'CARTAO',
           counterparty: card.institutionName,
         };
@@ -2086,14 +2122,46 @@ export default function App() {
       }
     }
 
+    const auditEntry: AuditLogEntry = {
+      id: generateEntityId('audit'),
+      action: 'CARD_PAYMENT_RECORDED',
+      entityType: 'TRANSFER',
+      entityId: card.id,
+      relatedEntityId: accountId,
+      actor: 'user',
+      timestamp: new Date().toISOString(),
+      reason: `Pagamento de fatura (${card.cardName}) conciliado como transferência interna`,
+      amountCents: amountToPayCents,
+      previousState: {
+        currentInvoiceAmount: card.currentInvoiceAmount,
+        status: card.status,
+      },
+      nextState: {
+        currentInvoiceAmount: fromCents(remainingCents),
+        status: remainingCents === 0 ? 'PAID' : 'OPEN',
+        accountId: accountId || null,
+      },
+    };
+    const nextAudit = appendAuditLog(auditEntry);
+
     setCreditCards(nextCards);
     if (nextTransactions) {
       setTransactions(nextTransactions);
     }
+    setAuditLogs(nextAudit);
     void commitAtomicMutationBatch({
       creditCards: nextCards,
+      auditLogs: nextAudit,
       ...(nextTransactions ? { transactions: nextTransactions } : {}),
     });
+
+    setFeedbackBanner(
+      `Fatura de "${card.cardName}" paga (R$ ${fromCents(amountToPayCents).toLocaleString('pt-BR', {
+        minimumFractionDigits: 2,
+        maximumFractionDigits: 2,
+      })}) e conciliada como transferência interna.`
+    );
+    setTimeout(() => setFeedbackBanner(null), 4500);
   };
 
   const handleUpdateCardInvoice = (cardId: string, amount: number, mode: 'add' | 'set') => {
@@ -3002,6 +3070,7 @@ export default function App() {
               accounts={derivedAccounts}
               transactions={transactions}
               boletos={boletos}
+              creditCards={creditCards}
               categoryRules={categoryRules}
               selectedAccountId={selectedAccountIdForAnalytics}
               onClearSelectedAccount={() => setSelectedAccountIdForAnalytics(null)}
@@ -3020,6 +3089,7 @@ export default function App() {
               onRestoreTransaction={handleRestoreTransaction}
               onCommitSpreadsheetImport={handleCommitSpreadsheetImport}
               onExecuteTransfer={handleInternalTransfer}
+              onPayCardInvoice={handlePayCardInvoice}
             />
           )}
 
@@ -3040,6 +3110,7 @@ export default function App() {
               onSaveTransactionBatch={handleSaveTransactionBatch}
               onDeleteTransaction={handleDeleteTransaction}
               onCommitCardImport={handleCommitCardImport}
+              onUpsertCategoryRules={handleUpsertCategoryRules}
               onEditTransaction={openEditModal}
               onRegisterPurchase={(card) => {
                 setEditingTransaction(null);

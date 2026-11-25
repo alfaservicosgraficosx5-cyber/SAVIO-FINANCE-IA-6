@@ -19,6 +19,7 @@ import { CardFinancialCalendar } from './cards/CardFinancialCalendar';
 import { CardSpreadsheetViews } from './cards/CardSpreadsheetViews';
 import { CardSpreadsheetImportTab } from './cards/CardSpreadsheetImportTab';
 import { CardEntryModal } from './cards/CardEntryModal';
+import { CardInvoiceImportModal } from './cards/CardInvoiceImportModal';
 import {
   AlertCircle,
   ArrowLeft,
@@ -64,6 +65,7 @@ interface CardsViewProps {
     items: Omit<Transaction, 'id'>[],
     meta: { fileName: string; batchFingerprint: string; cardId: string }
   ) => { acceptedCount: number; skippedDuplicatesCount: number };
+  onUpsertCategoryRules?: (rules: CategoryRule[]) => void;
   onEditTransaction?: (tx: Transaction) => void;
   onRegisterPurchase?: (card: CreditCardType) => void;
 }
@@ -84,11 +86,13 @@ export const CardsView: React.FC<CardsViewProps> = ({
   onSaveTransactionBatch,
   onDeleteTransaction,
   onCommitCardImport,
+  onUpsertCategoryRules,
   onEditTransaction,
   onRegisterPurchase,
 }) => {
   const { hideValues } = usePrivacy();
   const [modalOpen, setModalOpen] = useState(false);
+  const [importModalOpen, setImportModalOpen] = useState(false);
   const [activeCardId, setActiveCardId] = useState<string | null>(selectedCardId);
   const [workspaceTab, setWorkspaceTab] = useState<CardWorkspaceTab>('CALENDAR');
 
@@ -456,8 +460,16 @@ export const CardsView: React.FC<CardsViewProps> = ({
 
                 <button
                   type="button"
+                  onClick={() => setImportModalOpen(true)}
+                  className="min-h-10 px-3.5 rounded-xl bg-[#059669] hover:bg-emerald-700 text-white text-xs font-bold flex items-center gap-1.5 cursor-pointer"
+                >
+                  <Upload size={14} /> Importar Fatura
+                </button>
+
+                <button
+                  type="button"
                   onClick={() => handleOpenAddEntryForDate(selectedDate)}
-                  className="min-h-10 px-3.5 rounded-xl bg-[#061E3E] hover:bg-[#0F172A] dark:bg-[#059669] dark:hover:bg-emerald-700 text-white text-xs font-bold flex items-center gap-1.5 cursor-pointer"
+                  className="min-h-10 px-3.5 rounded-xl bg-[#061E3E] hover:bg-[#0F172A] dark:bg-slate-800 dark:hover:bg-slate-700 border border-transparent dark:border-slate-700 text-white text-xs font-bold flex items-center gap-1.5 cursor-pointer"
                 >
                   <Plus size={14} /> Novo lançamento
                 </button>
@@ -565,6 +577,7 @@ export const CardsView: React.FC<CardsViewProps> = ({
               card={activeCard}
               transactions={transactions}
               categoryRules={categoryRules}
+              onUpsertCategoryRules={onUpsertCategoryRules}
               onCommitCardImport={(items, meta) => {
                 if (onCommitCardImport) {
                   return onCommitCardImport(items, meta);
@@ -622,17 +635,29 @@ export const CardsView: React.FC<CardsViewProps> = ({
                 Cada cartão possui planilha própria, calendário independente, parcelamentos e ciclo de fechamento.
               </p>
             </div>
-            <button
-              type="button"
-              onClick={() => {
-                setErrorMsg('');
-                setModalOpen(true);
-              }}
-              className="bg-[#061E3E] hover:bg-[#0F172A] dark:bg-[#059669] dark:hover:bg-emerald-700 text-white px-4 min-h-11 rounded-xl text-xs sm:text-sm font-semibold transition-colors flex items-center justify-center gap-2 cursor-pointer"
-            >
-              <Plus className="w-4 h-4" />
-              Novo cartão
-            </button>
+            <div className="flex flex-wrap items-center gap-2">
+              {cards.length > 0 && (
+                <button
+                  type="button"
+                  onClick={() => setImportModalOpen(true)}
+                  className="bg-[#059669] hover:bg-emerald-700 text-white px-4 min-h-11 rounded-xl text-xs sm:text-sm font-semibold transition-colors flex items-center justify-center gap-2 cursor-pointer"
+                >
+                  <Upload className="w-4 h-4" />
+                  Importar Fatura
+                </button>
+              )}
+              <button
+                type="button"
+                onClick={() => {
+                  setErrorMsg('');
+                  setModalOpen(true);
+                }}
+                className="bg-[#061E3E] hover:bg-[#0F172A] dark:bg-slate-800 dark:hover:bg-slate-700 border border-transparent dark:border-slate-700 text-white px-4 min-h-11 rounded-xl text-xs sm:text-sm font-semibold transition-colors flex items-center justify-center gap-2 cursor-pointer"
+              >
+                <Plus className="w-4 h-4" />
+                Novo cartão
+              </button>
+            </div>
           </div>
 
           <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-5">
@@ -1368,6 +1393,31 @@ export const CardsView: React.FC<CardsViewProps> = ({
           </div>
         )}
       </Sheet>
+
+      {/* Automated PDF/CSV/OFX Invoice Import & Review Modal */}
+      <CardInvoiceImportModal
+        open={importModalOpen}
+        cards={cards}
+        initialCardId={activeCard?.id || cards[0]?.id || null}
+        transactions={transactions}
+        categoryRules={categoryRules}
+        onClose={() => setImportModalOpen(false)}
+        onCommitCardImport={(items, meta) => {
+          if (onCommitCardImport) {
+            return onCommitCardImport(items, meta);
+          }
+          if (onSaveTransactionBatch) {
+            const full = items.map((item, i) => ({
+              ...item,
+              id: `tr-card-imp-${Date.now()}-${i}`,
+            })) as Transaction[];
+            onSaveTransactionBatch(full);
+            return { acceptedCount: full.length, skippedDuplicatesCount: 0 };
+          }
+          return { acceptedCount: 0, skippedDuplicatesCount: 0 };
+        }}
+        onUpsertCategoryRules={onUpsertCategoryRules}
+      />
     </div>
   );
 };

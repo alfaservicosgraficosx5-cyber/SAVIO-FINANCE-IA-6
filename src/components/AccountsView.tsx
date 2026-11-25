@@ -3,6 +3,7 @@ import {
   Account,
   Boleto,
   CategoryRule,
+  CreditCard,
   CROSS_ENTITY_NATURE_LABELS,
   CrossEntityTransferNature,
   Transaction,
@@ -17,6 +18,7 @@ import {
   Wallet,
   Plus,
   CheckCircle2,
+  CreditCard as CreditCardIcon,
   Trash2,
   AlertCircle,
   Archive,
@@ -45,6 +47,7 @@ interface AccountsViewProps {
   accounts: Account[];
   transactions: Transaction[];
   boletos?: Boleto[];
+  creditCards?: CreditCard[];
   categoryRules?: CategoryRule[];
   selectedAccountId?: string | null;
   onClearSelectedAccount?: () => void;
@@ -69,12 +72,14 @@ interface AccountsViewProps {
     notes?: string;
     crossEntityNature?: CrossEntityTransferNature;
   }) => { ok: boolean; error?: string };
+  onPayCardInvoice?: (cardId: string, accountId?: string, paidAmount?: number) => void;
 }
 
 export const AccountsView: React.FC<AccountsViewProps> = ({
   accounts,
   transactions,
   boletos,
+  creditCards = [],
   categoryRules = [],
   selectedAccountId = null,
   onClearSelectedAccount,
@@ -88,6 +93,7 @@ export const AccountsView: React.FC<AccountsViewProps> = ({
   onRestoreTransaction,
   onCommitSpreadsheetImport,
   onExecuteTransfer,
+  onPayCardInvoice,
 }) => {
   const { hideValues } = usePrivacy();
   const isDesktop = useIsDesktop();
@@ -125,6 +131,12 @@ export const AccountsView: React.FC<AccountsViewProps> = ({
     useState<CrossEntityTransferNature>('TRANSFERENCIA_NEUTRA');
   const [awaitingTransferConfirm, setAwaitingTransferConfirm] = useState(false);
   const [transferError, setTransferError] = useState('');
+
+  const [payInvoiceModalOpen, setPayInvoiceModalOpen] = useState(false);
+  const [payCardId, setPayCardId] = useState('');
+  const [payOriginAccountId, setPayOriginAccountId] = useState('');
+  const [payAmountStr, setPayAmountStr] = useState('');
+  const [payError, setPayError] = useState('');
 
   const activeAccounts = useMemo(() => accounts.filter((a) => !a.archived), [accounts]);
 
@@ -251,6 +263,32 @@ export const AccountsView: React.FC<AccountsViewProps> = ({
             >
               <ArrowLeftRight className="w-4 h-4 text-[#059669]" />
               Transferir entre contas
+            </button>
+          )}
+          {onPayCardInvoice && creditCards.length > 0 && activeAccounts.length > 0 && (
+            <button
+              type="button"
+              onClick={() => {
+                const preferredCard =
+                  creditCards.find((c) => c.currentInvoiceAmount > 0) || creditCards[0];
+                const preferredAcc =
+                  activeAccounts.find((a) => a.id === preferredCard?.linkedAccountId) ||
+                  activeAccounts.find((a) => a.entityId === preferredCard?.entityId) ||
+                  activeAccounts[0];
+                setPayCardId(preferredCard?.id || '');
+                setPayOriginAccountId(preferredAcc?.id || '');
+                setPayAmountStr(
+                  preferredCard && preferredCard.currentInvoiceAmount > 0
+                    ? preferredCard.currentInvoiceAmount.toFixed(2).replace('.', ',')
+                    : ''
+                );
+                setPayError('');
+                setPayInvoiceModalOpen(true);
+              }}
+              className="sf-card-interactive px-4 min-h-11 text-xs sm:text-sm font-semibold text-[#0F172A] dark:text-slate-200 flex items-center justify-center gap-2 cursor-pointer"
+            >
+              <CreditCardIcon className="w-4 h-4 text-[#059669]" />
+              Pagar Fatura
             </button>
           )}
           <button
@@ -1055,6 +1093,125 @@ export const AccountsView: React.FC<AccountsViewProps> = ({
             >
               <ArrowLeftRight size={16} />{' '}
               {awaitingTransferConfirm ? 'Confirmar transferência' : 'Conferir transferência'}
+            </button>
+          </div>
+        </form>
+      </Sheet>
+
+      {/* Pay Credit Card Invoice Sheet (Internal Transfer Reconciliation) */}
+      <Sheet
+        open={payInvoiceModalOpen}
+        onClose={() => setPayInvoiceModalOpen(false)}
+        title="Pagar Fatura de Cartão"
+        subtitle="Conciliação contábil via transferência interna sem duplicar despesas"
+      >
+        <form
+          onSubmit={(e) => {
+            e.preventDefault();
+            setPayError('');
+            if (!onPayCardInvoice || !payCardId || !payOriginAccountId) {
+              setPayError('Selecione o cartão e a conta bancária de pagamento.');
+              return;
+            }
+            let paidCents: MoneyCents;
+            try {
+              paidCents = parseMoneyInput(payAmountStr);
+            } catch (err) {
+              setPayError(err instanceof Error ? err.message : 'Informe um valor válido.');
+              return;
+            }
+            if (paidCents <= 0) {
+              setPayError('Informe um valor maior que zero.');
+              return;
+            }
+            const targetCard = creditCards.find((c) => c.id === payCardId);
+            onPayCardInvoice(payCardId, payOriginAccountId, fromCents(paidCents));
+            setPayInvoiceModalOpen(false);
+            setActionMsg(
+              `Pagamento da fatura de "${targetCard?.cardName || 'Cartão'}" conciliado como transferência interna.`
+            );
+            setTimeout(() => setActionMsg(''), 4500);
+          }}
+          className="space-y-4"
+        >
+          {payError && (
+            <div className="p-3 bg-red-50 dark:bg-red-950/60 border border-red-200 dark:border-red-800 text-red-700 dark:text-red-300 rounded-xl text-xs flex items-center gap-2">
+              <AlertCircle size={15} /> {payError}
+            </div>
+          )}
+
+          <div>
+            <label className="block text-xs font-semibold text-slate-500 dark:text-slate-400 mb-1">
+              Cartão de Crédito
+            </label>
+            <select
+              value={payCardId}
+              onChange={(e) => {
+                const nextId = e.target.value;
+                setPayCardId(nextId);
+                const c = creditCards.find((card) => card.id === nextId);
+                if (c) {
+                  setPayAmountStr(
+                    c.currentInvoiceAmount > 0
+                      ? c.currentInvoiceAmount.toFixed(2).replace('.', ',')
+                      : ''
+                  );
+                }
+              }}
+              className="w-full border border-slate-200 dark:border-slate-700 rounded-xl px-3 py-3 text-sm bg-white dark:bg-slate-800 text-slate-900 dark:text-white min-h-12"
+            >
+              {creditCards.map((c) => (
+                <option key={c.id} value={c.id}>
+                  {c.institutionName} · {c.cardName} ({c.entityId}) — Fatura{' '}
+                  {formatarValor(c.currentInvoiceAmount, hideValues)}
+                </option>
+              ))}
+            </select>
+          </div>
+
+          <div>
+            <label className="block text-xs font-semibold text-slate-500 dark:text-slate-400 mb-1">
+              Conta Bancária de Pagamento
+            </label>
+            <select
+              value={payOriginAccountId}
+              onChange={(e) => setPayOriginAccountId(e.target.value)}
+              className="w-full border border-slate-200 dark:border-slate-700 rounded-xl px-3 py-3 text-sm bg-white dark:bg-slate-800 text-slate-900 dark:text-white min-h-12"
+            >
+              {activeAccounts.map((acc) => (
+                <option key={acc.id} value={acc.id}>
+                  {acc.institutionName} · {acc.accountName} ({acc.entityId}) —{' '}
+                  {formatarValor(acc.balance, hideValues)}
+                </option>
+              ))}
+            </select>
+          </div>
+
+          <MoneyInputField
+            label="Valor pago (R$)"
+            required
+            value={payAmountStr}
+            onChange={setPayAmountStr}
+          />
+
+          <div className="p-3 rounded-xl bg-emerald-50/80 dark:bg-emerald-950/40 border border-emerald-200 dark:border-emerald-800/70 text-[11px] text-emerald-900 dark:text-emerald-200">
+            Debita o saldo da conta bancária selecionada e abate a fatura do cartão como{' '}
+            <strong>Transferência Interna</strong>, preservando os gráficos de despesas Consolidado / CPF / CNPJ sem dupla contagem.
+          </div>
+
+          <div className="flex gap-3 pt-2">
+            <button
+              type="button"
+              onClick={() => setPayInvoiceModalOpen(false)}
+              className="flex-1 min-h-12 border border-slate-300 dark:border-slate-700 rounded-xl text-sm font-semibold text-slate-700 dark:text-slate-200 cursor-pointer"
+            >
+              Cancelar
+            </button>
+            <button
+              type="submit"
+              className="flex-[1.5] min-h-12 bg-[#059669] hover:bg-emerald-700 text-white rounded-xl text-sm font-bold flex items-center justify-center gap-2 cursor-pointer"
+            >
+              <CheckCircle2 size={16} /> Confirmar Pagamento
             </button>
           </div>
         </form>

@@ -92,8 +92,8 @@ describe('Auditoria Estática & Invariantes de Segurança — firestore.rules', 
     }
   });
 
-  it('garante que serializeTransactionDoc e serializeAccountDoc não emitem chaves fora da allowlist de firestore.rules', async () => {
-    const { serializeTransactionDoc, serializeAccountDoc } = await import(
+  it('garante que serializeTransactionDoc, serializeAccountDoc e serializeCategoryRuleDoc não emitem chaves fora da allowlist de firestore.rules', async () => {
+    const { serializeTransactionDoc, serializeAccountDoc, serializeCategoryRuleDoc } = await import(
       './src/services/cloudSyncService'
     );
 
@@ -154,6 +154,7 @@ describe('Auditoria Estática & Invariantes de Segurança — firestore.rules', 
         billingDueDate: '2026-12-02',
         cardEntryKind: 'PURCHASE',
         installmentGroupId: 'grp-1',
+        import_hash: 'a'.repeat(64),
       },
       '2026-11-23T12:00:00.000Z'
     );
@@ -193,6 +194,31 @@ describe('Auditoria Estática & Invariantes de Segurança — firestore.rules', 
     }
     for (const key of Object.keys(serializedAcc)) {
       expect(accAllowed.has(key), `Campo não permitido em firestore.rules (Account): ${key}`).toBe(true);
+    }
+
+    const ruleRequired = extractList('isValidCategoryRule', 'hasAll');
+    const ruleAllowed = new Set(extractList('isValidCategoryRule', 'hasOnly'));
+    const serializedRule = serializeCategoryRuleDoc(
+      'uid-test-1',
+      {
+        id: 'rule-1',
+        keyword: 'AMAZON',
+        category: 'Compras',
+        category_id: 'Compras',
+        profile: 'CNPJ',
+        entityId: 'CNPJ',
+        card_id: 'card-1',
+        direction: 'EXPENSE',
+        createdAt: '2026-11-24T12:00:00.000Z',
+      },
+      '2026-11-24T12:00:00.000Z'
+    );
+
+    for (const reqKey of ruleRequired) {
+      expect(serializedRule, `Campo obrigatório ausente em serializeCategoryRuleDoc: ${reqKey}`).toHaveProperty(reqKey);
+    }
+    for (const key of Object.keys(serializedRule)) {
+      expect(ruleAllowed.has(key), `Campo não permitido em firestore.rules (CategoryRule): ${key}`).toBe(true);
     }
   });
 });

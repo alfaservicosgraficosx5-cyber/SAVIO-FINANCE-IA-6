@@ -100,6 +100,7 @@
         "billingDueDate": { "type": "string" },
         "cardEntryKind": { "type": "string" },
         "installmentGroupId": { "type": "string" },
+        "import_hash": { "type": "string" },
         "revision": { "type": "number" },
         "createdAt": { "type": "string" },
         "updatedAt": { "type": "string" }
@@ -260,6 +261,10 @@
         "ownerUid": { "type": "string" },
         "keyword": { "type": "string" },
         "category": { "type": "string" },
+        "category_id": { "type": "string" },
+        "profile": { "type": "string", "enum": ["CPF", "CNPJ"] },
+        "entityId": { "type": "string", "enum": ["CPF", "CNPJ"] },
+        "card_id": { "type": "string" },
         "direction": { "type": "string", "enum": ["INCOME", "EXPENSE"] },
         "revision": { "type": "number" },
         "createdAt": { "type": "string" },

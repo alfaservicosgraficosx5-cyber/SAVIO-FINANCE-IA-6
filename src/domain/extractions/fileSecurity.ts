@@ -206,6 +206,205 @@ export async function computeBufferFingerprint(buffer: ArrayBuffer, fileName = '
   return computeFastHash(sample);
 }
 
+export const MAX_PDF_PAGES = 50;
+
+export function validatePdfPageCount(pageCount: number): { ok: boolean; error?: string } {
+  if (!Number.isFinite(pageCount) || pageCount < 0) {
+    return { ok: false, error: 'Contagem de páginas PDF inválida.' };
+  }
+  if (pageCount > MAX_PDF_PAGES) {
+    return {
+      ok: false,
+      error: `PDF possui ${pageCount} páginas, excedendo o limite seguro de ${MAX_PDF_PAGES} páginas por lote.`,
+    };
+  }
+  return { ok: true };
+}
+
+export interface BufferSignatureCheckResult {
+  ok: boolean;
+  detectedMime: string;
+  error?: string;
+}
+
+/**
+ * Inspects actual magic bytes / structural headers of an uploaded buffer to verify
+ * real MIME consistency and reject disguised executables, scripts, or SVG payloads.
+ */
+export function inspectBufferRealMimeAndSecurity(
+  buffer: ArrayBuffer,
+  expectedFormat: ExtractionFileFormat
+): BufferSignatureCheckResult {
+  const bytes = new Uint8Array(buffer);
+  if (bytes.length === 0) {
+    return { ok: false, detectedMime: 'application/x-empty', error: 'Arquivo vazio.' };
+  }
+
+  // Reject Windows PE executable ("MZ") or ELF binary disguised as statement
+  if ((bytes[0] === 0x4d && bytes[1] === 0x5a) || (bytes[0] === 0x7f && bytes[1] === 0x45 && bytes[2] === 0x4c && bytes[3] === 0x46)) {
+    return {
+      ok: false,
+      detectedMime: 'application/x-executable',
+      error: 'Conteúdo binário executável não permitido para importação financeira.',
+    };
+  }
+
+  const startsWithAscii = (sig: string, offset = 0): boolean => {
+    if (bytes.length < offset + sig.length) return false;
+    for (let i = 0; i < sig.length; i++) {
+      if (bytes[offset + i] !== sig.charCodeAt(i)) return false;
+    }
+    return true;
+  };
+
+  if (expectedFormat === 'PDF') {
+    // Allow optional leading whitespace/BOM before %PDF-
+    let headerAscii = '';
+    for (let i = 0; i < Math.min(32, bytes.length); i++) {
+      headerAscii += String.fromCharCode(bytes[i]);
+    }
+    if (!headerAscii.includes('%PDF-')) {
+      return {
+        ok: false,
+        detectedMime: 'application/octet-stream',
+        error: 'Assinatura interna inválida: o arquivo não corresponde a um PDF legítimo (%PDF-).',
+      };
+    }
+    return { ok: true, detectedMime: 'application/pdf' };
+  }
+
+  if (expectedFormat === 'IMAGE') {
+    const isPng = bytes.length >= 8 && bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4e && bytes[3] === 0x47;
+    const isJpg = bytes.length >= 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff;
+    const isWebp = startsWithAscii('RIFF', 0) && startsWithAscii('WEBP', 8);
+    if (!isPng && !isJpg && !isWebp) {
+      return {
+        ok: false,
+        detectedMime: 'application/octet-stream',
+        error: 'Assinatura de imagem inválida (permitidos apenas PNG, JPG/JPEG ou WEBP reais).',
+      };
+    }
+    return {
+      ok: true,
+      detectedMime: isPng ? 'image/png' : isJpg ? 'image/jpeg' : 'image/webp',
+    };
+  }
+
+  if (expectedFormat === 'XLSX' || expectedFormat === 'XLS') {
+    const isZipXlsx = bytes.length >= 4 && bytes[0] === 0x50 && bytes[1] === 0x4b && bytes[2] === 0x03 && bytes[3] === 0x04;
+    const isOleXls = bytes.length >= 4 && bytes[0] === 0xd0 && bytes[1] === 0xcf && bytes[2] === 0x11 && bytes[3] === 0xe0;
+    // Some banks (e.g. legacy BB/Santander .xls exports) output HTML tables or CSV renamed as .xls
+    let headText = '';
+    for (let i = 0; i < Math.min(256, bytes.length); i++) {
+      headText += String.fromCharCode(bytes[i]);
+    }
+    const lowerHead = headText.toLowerCase();
+    if (isZipXlsx) return { ok: true, detectedMime: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' };
+    if (isOleXls) return { ok: true, detectedMime: 'application/vnd.ms-excel' };
+    if (expectedFormat === 'XLS' && (lowerHead.includes('<table') || lowerHead.includes(';'))) {
+      return { ok: true, detectedMime: 'application/vnd.ms-excel' };
+    }
+    return {
+      ok: false,
+      detectedMime: 'application/octet-stream',
+      error: 'Assinatura de planilha inválida para o arquivo XLSX/XLS enviado.',
+    };
+  }
+
+  // Text-based formats: OFX, CSV, XML, JSON
+  // Reject arbitrary binary files containing NUL bytes (except UTF-16 BOM text exports)
+  const hasUtf16Bom =
+    bytes.length >= 2 &&
+    ((bytes[0] === 0xff && bytes[1] === 0xfe) || (bytes[0] === 0xfe && bytes[1] === 0xff));
+  if (!hasUtf16Bom) {
+    const scanLen = Math.min(1024, bytes.length);
+    let nulCount = 0;
+    for (let i = 0; i < scanLen; i++) {
+      if (bytes[i] === 0) nulCount++;
+    }
+    if (nulCount > 2) {
+      return {
+        ok: false,
+        detectedMime: 'application/octet-stream',
+        error: `Conteúdo binário detectado em arquivo esperado como ${expectedFormat}.`,
+      };
+    }
+  }
+
+  let sample = '';
+  for (let i = 0; i < Math.min(2048, bytes.length); i++) {
+    sample += String.fromCharCode(bytes[i]);
+  }
+  const trimmed = sample.replace(/^\uFEFF/, '').trim();
+  const lowerSample = trimmed.toLowerCase();
+
+  if (lowerSample.includes('<svg') || lowerSample.includes('<script')) {
+    return {
+      ok: false,
+      detectedMime: 'text/html',
+      error: 'Conteúdo ativo (<script>/<svg>) bloqueado por segurança.',
+    };
+  }
+
+  if (expectedFormat === 'JSON' && !trimmed.startsWith('{') && !trimmed.startsWith('[')) {
+    return {
+      ok: false,
+      detectedMime: 'text/plain',
+      error: 'Arquivo JSON inválido: estrutura deve iniciar com { ou [.',
+    };
+  }
+
+  if (expectedFormat === 'XML' && !trimmed.includes('<')) {
+    return {
+      ok: false,
+      detectedMime: 'text/plain',
+      error: 'Arquivo XML inválido: estrutura XML não encontrada.',
+    };
+  }
+
+  const mimeMap: Record<ExtractionFileFormat, string> = {
+    OFX: 'application/x-ofx',
+    CSV: 'text/csv',
+    XML: 'application/xml',
+    JSON: 'application/json',
+    XLSX: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+    XLS: 'application/vnd.ms-excel',
+    PDF: 'application/pdf',
+    IMAGE: 'image/jpeg',
+  };
+
+  return { ok: true, detectedMime: mimeMap[expectedFormat] };
+}
+
+export function maskCardNumber(raw?: string): string {
+  const digits = digitsOnly(raw || '');
+  if (!digits) return '';
+  if (digits.length <= 4) return `•••• ${digits}`;
+  return `•••• •••• •••• ${digits.slice(-4)}`;
+}
+
+export function maskAgencyAndAccount(agency?: string, account?: string): string {
+  const maskedAg = agency ? `Ag ${agency.replace(/\d(?=\d{2})/g, '•')}` : '';
+  const maskedAcc = account ? `Cc ${maskAccountNumber(account)}` : '';
+  return [maskedAg, maskedAcc].filter(Boolean).join(' · ');
+}
+
+/**
+ * Redacts CPF, CNPJ, 16-digit card PANs, and sensitive credentials before writing logs/audit diagnostics.
+ */
+export function redactSensitiveBankData(input: string): string {
+  if (!input) return '';
+  return String(input)
+    // Formatted or plain CNPJ (14 digits)
+    .replace(/\b(\d{2})[.\s]?(\d{3})[.\s]?(\d{3})[\/\s]?(\d{4})[-\s]?(\d{2})\b/g, '**.***.***/$4-**')
+    // Formatted CPF (11 digits with punctuation)
+    .replace(/\b(\d{3})\.(\d{3})\.(\d{3})-(\d{2})\b/g, '***.$2.***-**')
+    // 16-digit card PAN (grouped or continuous)
+    .replace(/\b(\d{4})[\s-]?(\d{4})[\s-]?(\d{4})[\s-]?(\d{4})\b/g, '•••• •••• •••• $4')
+    // Bearer / token / password key-value patterns
+    .replace(/(password|senha|token|secret|cvv)\s*[:=]\s*[^\s,;]+/gi, '$1=[REDACTED]');
+}
+
 /**
  * Strips any sensitive banking credentials or tokens before storing raw row snapshots.
  */
@@ -222,7 +421,7 @@ export function sanitizeRawRowSnapshot(
     } else if (typeof v === 'number' || typeof v === 'boolean') {
       out[k] = v;
     } else {
-      out[k] = sanitizeExtractedText(String(v), 240);
+      out[k] = redactSensitiveBankData(sanitizeExtractedText(String(v), 240));
     }
   }
   return out;

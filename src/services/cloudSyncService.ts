@@ -443,6 +443,7 @@ export function serializeTransactionDoc(
     ...(tx.billingDueDate ? { billingDueDate: clampStr(tx.billingDueDate, 32) } : {}),
     ...(tx.cardEntryKind ? { cardEntryKind: clampStr(tx.cardEntryKind, 32) } : {}),
     ...(tx.installmentGroupId ? { installmentGroupId: clampStr(tx.installmentGroupId, 128) } : {}),
+    ...(tx.import_hash ? { import_hash: clampStr(tx.import_hash, 128) } : {}),
     createdAt: validTimestampOrFallback(existingCreatedAt, nowIso),
     updatedAt: nowIso,
   };
@@ -608,17 +609,27 @@ function serializeBudgetDoc(
   };
 }
 
-function serializeCategoryRuleDoc(
+export function serializeCategoryRuleDoc(
   uid: string,
   r: CategoryRule,
   nowIso: string,
   existingCreatedAt?: string
 ): Record<string, unknown> {
+  const safeProfile =
+    r.profile === 'CPF' || r.profile === 'CNPJ'
+      ? r.profile
+      : r.entityId === 'CPF' || r.entityId === 'CNPJ'
+        ? r.entityId
+        : undefined;
+  const categoryVal = clampStr(r.category || r.category_id, 120, 'Outros');
   return {
     id: r.id,
     ownerUid: uid,
     keyword: clampStr(r.keyword, 120, 'regra'),
-    category: clampStr(r.category, 120, 'Outros'),
+    category: categoryVal,
+    ...(r.category_id || categoryVal ? { category_id: clampStr(r.category_id || categoryVal, 120, 'Outros') } : {}),
+    ...(safeProfile ? { profile: safeProfile, entityId: safeProfile } : {}),
+    ...(r.card_id ? { card_id: clampStr(r.card_id, 128) } : {}),
     ...(r.direction === 'INCOME' || r.direction === 'EXPENSE' ? { direction: r.direction } : {}),
     createdAt: validTimestampOrFallback(existingCreatedAt || r.createdAt, nowIso),
     updatedAt: nowIso,
@@ -696,7 +707,21 @@ export async function fetchUserCloudDataset(uid: string): Promise<{
     docSnap.docs.map((d) => stripCloudMeta(d.data()) as unknown as DocumentItem)
   );
   const budgets = budgetSnap.docs.map((d) => stripCloudMeta(d.data()) as unknown as CategoryBudget);
-  const categoryRules = ruleSnap.docs.map((d) => stripCloudMeta(d.data()) as unknown as CategoryRule);
+  const categoryRules = ruleSnap.docs.map((d) => {
+    const raw = stripCloudMeta(d.data()) as unknown as CategoryRule;
+    const profile =
+      raw.profile === 'CPF' || raw.profile === 'CNPJ'
+        ? raw.profile
+        : raw.entityId === 'CPF' || raw.entityId === 'CNPJ'
+          ? raw.entityId
+          : undefined;
+    return {
+      ...raw,
+      category: raw.category || raw.category_id || 'Outros',
+      category_id: raw.category_id || raw.category || 'Outros',
+      ...(profile ? { profile, entityId: profile } : {}),
+    };
+  });
 
   let salaries: SalaryDataset = { sources: [], records: [], adjustments: [] };
   if (salarySnap.exists()) {

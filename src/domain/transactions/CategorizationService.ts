@@ -85,7 +85,13 @@ export function categorizeTransactionDescription(params: {
   direction: Direction;
   customRules?: CategoryRule[];
   fallbackCategory?: string;
-}): { category: string; matchedRuleKeyword?: string; isCustomRule?: boolean } {
+  cardId?: string;
+}): {
+  category: string;
+  profile?: 'CPF' | 'CNPJ';
+  matchedRuleKeyword?: string;
+  isCustomRule?: boolean;
+} {
   const normDesc = normalizeDescription(params.description || '');
   const fallback = params.fallbackCategory || 'Outros';
 
@@ -93,13 +99,28 @@ export function categorizeTransactionDescription(params: {
     return { category: fallback };
   }
 
-  // 1. Custom user rules take precedence
-  for (const rule of params.customRules ?? []) {
+  // 1. Custom user / classification_rules take precedence (card-specific & longest keyword first)
+  const sortedRules = [...(params.customRules ?? [])].sort((a, b) => {
+    const aCardMatch = params.cardId && a.card_id === params.cardId ? 1 : 0;
+    const bCardMatch = params.cardId && b.card_id === params.cardId ? 1 : 0;
+    if (aCardMatch !== bCardMatch) return bCardMatch - aCardMatch;
+    return (b.keyword || '').trim().length - (a.keyword || '').trim().length;
+  });
+
+  for (const rule of sortedRules) {
     if (rule.direction && rule.direction !== params.direction) continue;
+    if (rule.card_id && params.cardId && rule.card_id !== params.cardId) continue;
     const kw = normalizeDescription(rule.keyword);
     if (kw && normDesc.includes(kw)) {
+      const resolvedProfile =
+        rule.profile === 'CPF' || rule.profile === 'CNPJ'
+          ? rule.profile
+          : rule.entityId === 'CPF' || rule.entityId === 'CNPJ'
+            ? rule.entityId
+            : undefined;
       return {
-        category: rule.category,
+        category: rule.category || rule.category_id || fallback,
+        ...(resolvedProfile ? { profile: resolvedProfile } : {}),
         matchedRuleKeyword: rule.keyword,
         isCustomRule: true,
       };

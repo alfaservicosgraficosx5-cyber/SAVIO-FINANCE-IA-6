@@ -2,8 +2,10 @@ import type { MoneyCents } from '../../money/money';
 import type { Account } from '../../../types';
 import type { ParseResultPayload } from '../../../types-sub/extractions';
 import {
+  MAX_PDF_PAGES,
   sanitizeExtractedText,
   sanitizeRawRowSnapshot,
+  validatePdfPageCount,
 } from '../fileSecurity';
 import { parseFlexibleDate, parseFlexibleSignedAmount } from './csvParser';
 import { detectBankFromStatement } from '../banksRepository';
@@ -85,6 +87,8 @@ export async function extractTextFromPdfBufferAsync(buffer: ArrayBuffer): Promis
   text: string;
   pageCount: number;
   engine: 'PDFJS' | 'RAW_STREAM';
+  pageCountExceeded?: boolean;
+  pageLimitError?: string;
 }> {
   try {
     const hasBrowserWorker = typeof window !== 'undefined' && typeof Worker !== 'undefined';
@@ -103,9 +107,11 @@ export async function extractTextFromPdfBufferAsync(buffer: ArrayBuffer): Promis
     });
 
     const doc = await loadingTask.promise;
+    const pageValidation = validatePdfPageCount(doc.numPages);
+    const pagesToRead = Math.min(doc.numPages, MAX_PDF_PAGES);
     const pageLines: string[] = [];
 
-    for (let pageNum = 1; pageNum <= doc.numPages; pageNum++) {
+    for (let pageNum = 1; pageNum <= pagesToRead; pageNum++) {
       const page = await doc.getPage(pageNum);
       const content = await page.getTextContent();
 
@@ -154,11 +160,21 @@ export async function extractTextFromPdfBufferAsync(buffer: ArrayBuffer): Promis
     await (doc as unknown as { destroy?: () => Promise<void> }).destroy?.();
 
     if (combined.length > 0) {
-      return { text: combined, pageCount: doc.numPages, engine: 'PDFJS' };
+      return {
+        text: combined,
+        pageCount: doc.numPages,
+        engine: 'PDFJS',
+        ...(pageValidation.ok ? {} : { pageCountExceeded: true, pageLimitError: pageValidation.error }),
+      };
     }
 
     const rawFallback = extractTextFromPdfBuffer(buffer);
-    return { text: rawFallback, pageCount: doc.numPages, engine: 'RAW_STREAM' };
+    return {
+      text: rawFallback,
+      pageCount: doc.numPages,
+      engine: 'RAW_STREAM',
+      ...(pageValidation.ok ? {} : { pageCountExceeded: true, pageLimitError: pageValidation.error }),
+    };
   } catch {
     return {
       text: extractTextFromPdfBuffer(buffer),
@@ -479,19 +495,20 @@ export async function requestRemoteOcrParse(params: {
   }
 
   try {
+    const normalizedMime = params.mimeType === 'image/jpg' ? 'image/jpeg' : params.mimeType;
     const resp = await fetchImpl(`${apiBaseUrl}/api/ai/parse-document`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       signal: timeoutController.signal,
       body: JSON.stringify({
-        fileName: params.fileName,
+        fileName: params.fileName.slice(0, 250),
         fileData: {
-          mimeType: params.mimeType,
+          mimeType: normalizedMime,
           base64: params.base64Data,
         },
-        knownAccounts: params.knownAccounts.map((a) => ({
-          institutionName: a.institutionName,
-          accountName: a.accountName,
+        knownAccounts: params.knownAccounts.slice(0, 40).map((a) => ({
+          institutionName: a.institutionName.slice(0, 120),
+          accountName: a.accountName.slice(0, 120),
           entityId: a.entityId,
         })),
       }),

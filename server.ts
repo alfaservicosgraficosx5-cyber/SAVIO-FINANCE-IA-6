@@ -14,6 +14,7 @@ import {
   ParseDocumentSchema,
   SlidingWindowRateLimiter,
   isOriginAllowedForAi,
+  resolveVerifiedInlineData,
   sanitizeTextInput,
   withTimeout,
 } from './src/server/aiGuard.ts';
@@ -64,6 +65,18 @@ function formatAiErrorResponse(err: unknown): { status: number; message: string 
     };
   }
   const msg = err instanceof Error ? err.message : 'Erro ao processar solicitação com IA.';
+  if (
+    msg.includes('API_KEY_INVALID') ||
+    msg.includes('API key not valid') ||
+    msg.includes('PERMISSION_DENIED') ||
+    msg.includes('403')
+  ) {
+    return {
+      status: 503,
+      message:
+        'Chave da API de IA ausente ou inválida no servidor. Verifique GEMINI_API_KEY nas configurações de segredos.',
+    };
+  }
   if (msg.includes('503') || msg.includes('UNAVAILABLE')) {
     return {
       status: 503,
@@ -83,7 +96,7 @@ function formatAiErrorResponse(err: unknown): { status: number; message: string 
     msg.includes('document has no pages')
   ) {
     return {
-      status: 400,
+      status: 422,
       message: 'Arquivo PDF ou imagem inválido, protegido por senha ou ilegível para leitura visual.',
     };
   }
@@ -244,23 +257,14 @@ async function startServer() {
       const parts: Array<{ inlineData?: { mimeType: string; data: string }; text?: string }> = [];
 
       if (fileData) {
-        let finalMime = fileData.mimeType;
-        const lowName = (fileName || '').toLowerCase();
-        if (lowName.endsWith('.pdf') || finalMime.includes('pdf')) {
-          finalMime = 'application/pdf';
-        } else if (lowName.endsWith('.png')) {
-          finalMime = 'image/png';
-        } else if (lowName.endsWith('.webp')) {
-          finalMime = 'image/webp';
-        } else if (lowName.endsWith('.jpg') || lowName.endsWith('.jpeg')) {
-          finalMime = 'image/jpeg';
-        } else if (finalMime === 'application/octet-stream' || !finalMime) {
-          finalMime = 'application/pdf';
+        const verified = resolveVerifiedInlineData(fileData, fileName);
+        if (!verified.ok) {
+          return res.status(verified.status).json({ error: verified.error });
         }
         parts.push({
           inlineData: {
-            mimeType: finalMime,
-            data: fileData.base64,
+            mimeType: verified.mimeType,
+            data: verified.base64,
           },
         });
       }
@@ -375,7 +379,11 @@ ${cleanText ? `\nTexto adicional:\n${cleanText}` : ''}`;
       res.json({ transactions: validated.data.transactions });
     } catch (error: unknown) {
       const formatted = formatAiErrorResponse(error);
-      console.error('Parse doc error:', formatted.status);
+      if (formatted.status >= 500) {
+        console.error('Parse doc error:', formatted.status, error instanceof Error ? error.name : 'UnknownError');
+      } else {
+        console.warn('Parse doc rejected:', formatted.status);
+      }
       res.status(formatted.status).json({ error: formatted.message });
     }
   });
@@ -398,7 +406,11 @@ ${cleanText ? `\nTexto adicional:\n${cleanText}` : ''}`;
       const { linhaDigitavel, textContent, fileData } = parsedBody.data;
       const parts: Array<{ inlineData?: { mimeType: string; data: string }; text?: string }> = [];
       if (fileData) {
-        parts.push({ inlineData: { mimeType: fileData.mimeType, data: fileData.base64 } });
+        const verified = resolveVerifiedInlineData(fileData);
+        if (!verified.ok) {
+          return res.status(verified.status).json({ error: verified.error });
+        }
+        parts.push({ inlineData: { mimeType: verified.mimeType, data: verified.base64 } });
       }
       const cleanLine = linhaDigitavel ? sanitizeTextInput(linhaDigitavel, 120) : 'N/A';
       const cleanText = textContent ? sanitizeTextInput(textContent, 15000) : 'N/A';
@@ -490,20 +502,14 @@ ${cleanText ? `\nTexto adicional:\n${cleanText}` : ''}`;
       const parts: Array<{ inlineData?: { mimeType: string; data: string }; text?: string }> = [];
 
       if (fileData && !isCsv) {
-        let finalMime = fileData.mimeType;
-        if (lowName.endsWith('.pdf') || finalMime.includes('pdf')) {
-          finalMime = 'application/pdf';
-        } else if (lowName.endsWith('.png')) {
-          finalMime = 'image/png';
-        } else if (lowName.endsWith('.webp')) {
-          finalMime = 'image/webp';
-        } else if (lowName.endsWith('.jpg') || lowName.endsWith('.jpeg')) {
-          finalMime = 'image/jpeg';
+        const verified = resolveVerifiedInlineData(fileData, fileName);
+        if (!verified.ok) {
+          return res.status(verified.status).json({ error: verified.error });
         }
         parts.push({
           inlineData: {
-            mimeType: finalMime,
-            data: fileData.base64,
+            mimeType: verified.mimeType,
+            data: verified.base64,
           },
         });
       }
@@ -597,12 +603,12 @@ REGRAS ESTRITAS:
 
       return res.json(sanitized);
     } catch (error: unknown) {
-      console.error('Audit card invoice error details:', error);
       if (isCsv && decodedCsvText.trim()) {
         return res.json(auditCardCsvContent(decodedCsvText, fileName));
       }
       const formatted = formatAiErrorResponse(error);
-      console.error('Audit card invoice error status:', formatted.status, formatted.message);
+      const safeErrCode = error instanceof Error ? error.name : 'UnknownError';
+      console.error('Audit card invoice error:', formatted.status, safeErrCode);
       return res.status(formatted.status).json({ error: formatted.message });
     }
   });

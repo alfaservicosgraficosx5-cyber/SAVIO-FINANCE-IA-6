@@ -134,6 +134,7 @@ export interface Transaction {
   billingDueDate?: string; // YYYY-MM-DD cycle due date
   cardEntryKind?: 'PURCHASE' | 'INSTALLMENT' | 'REVERSAL' | 'FEE' | 'PAYMENT';
   installmentGroupId?: string; // shared ID linking installment series
+  import_hash?: string; // deterministic SHA-256 per card to block duplicate invoice imports
 }
 
 export interface AuditLogEntry {
@@ -291,9 +292,15 @@ export interface CategoryRule {
   id: string;
   keyword: string;
   category: string;
+  category_id?: string;
+  profile?: EntityId;
+  entityId?: EntityId;
+  card_id?: string;
   direction?: Direction;
   createdAt: string;
 }
+
+export type ClassificationRule = CategoryRule;
 
 export interface LedgerDrilldownFilter {
   accountId?: string;

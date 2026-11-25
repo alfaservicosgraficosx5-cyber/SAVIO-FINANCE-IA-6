@@ -519,13 +519,30 @@ export function commitApprovedExtractionMovements(params: {
       m.reviewStatus === 'DUPLICIDADE'
   );
 
-  const updatedBatch: ExtractionBatch = {
+  const updatedBatchBase: ExtractionBatch = {
     ...batch,
     stage: allResolved ? 'concluido' : 'conferencia',
     status: allResolved ? 'CONCLUIDO' : 'APROVADO_PARCIAL',
     approvedAt: nowIso,
     approvedBy: approvedByLabel,
     movements: movementsCopy,
+  };
+
+  const hasRemainingWarnings = Boolean(
+    updatedBatchBase.integrityAudit?.findings.some(
+      (f) => f.severity === 'WARNING' && !f.resolvedAction
+    )
+  );
+
+  const updatedBatch: ExtractionBatch = {
+    ...updatedBatchBase,
+    auditLifecycleStatus: allResolved
+      ? hasRemainingWarnings
+        ? 'APPROVED_WITH_WARNINGS'
+        : 'INTEGRATED'
+      : hasRemainingWarnings
+        ? 'APPROVED_WITH_WARNINGS'
+        : 'APPROVED',
   };
 
   return {

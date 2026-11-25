@@ -28,6 +28,7 @@ export const STORAGE_KEYS = {
   accountExtensions: 'finance_ia_account_extensions',
   extractionRules: 'finance_ia_extraction_rules',
   consolidationPrefs: 'finance_ia_consolidation_prefs',
+  connectorStates: 'finance_ia_connector_states',
 } as const;
 
 export interface RecoveryBackup {

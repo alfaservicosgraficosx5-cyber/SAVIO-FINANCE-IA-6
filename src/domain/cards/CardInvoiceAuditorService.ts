@@ -4,6 +4,7 @@ import {
   type CategoryRule,
   type CreditCard,
   type Direction,
+  type EntityId,
   type Transaction,
   type TransactionStatus,
 } from '../../types';
@@ -17,6 +18,8 @@ import {
 } from '../money/money';
 import { addMonthsLocal, normalizeToIsoDate, todayLocal } from '../../utils/dateUtils';
 import { generateEntityId } from '../common/id';
+import { categorizeTransactionDescription } from '../transactions/CategorizationService';
+import { computeCardImportHash } from './cardImportHash';
 import {
   computeBillingCycleDates,
   type CardEntryKind,
@@ -81,6 +84,8 @@ export interface MappedAuditedCardRow extends MappedCardSpreadsheetRow {
   parcelaAtual: number;
   totalParcelas: number;
   auditedCategory: AuditedInvoiceCategory;
+  profile?: EntityId;
+  importHash?: string;
 }
 
 const IGNORED_INVOICE_LINE_PATTERNS: RegExp[] = [
@@ -136,15 +141,15 @@ export function extractInstallmentInfo(description: string): {
   cleanDescription: string;
 } {
   const raw = (description || '').trim();
-  // Match "PARC 2 DE 10", "PARCELA 02/10", "02/10" (avoiding full dates DD/MM/YYYY)
+  // Match "PARC 2 DE 10", "PARCELA 02/10", "02 de 10", "02/10" (avoiding full dates DD/MM/YYYY)
   const parcDeMatch = raw.match(/\bparc(?:ela)?\.?\s*(\d{1,2})\s*(?:de|\/)\s*(\d{1,2})\b/i);
-  const slashMatch =
+  const slashOrDeMatch =
     parcDeMatch ||
-    raw.match(/(?:^|\s|\()(\d{1,2})\s*\/\s*(\d{1,2})(?!\/\d)(?:\s|\)|$)/);
+    raw.match(/(?:^|\s|\()(\d{1,2})\s*(?:\/|de)\s*(\d{1,2})(?!\/\d)(?:\s|\)|$)/i);
 
-  if (slashMatch) {
-    const cur = Number(slashMatch[1]);
-    const tot = Number(slashMatch[2]);
+  if (slashOrDeMatch) {
+    const cur = Number(slashOrDeMatch[1]);
+    const tot = Number(slashOrDeMatch[2]);
     if (cur >= 1 && tot > 1 && tot <= 48 && cur <= tot) {
       return {
         tipo: 'parcelada',
@@ -543,7 +548,7 @@ export function mapAuditedInvoiceToCardRows(params: {
   existingTransactions: readonly Transaction[];
   categoryRules?: readonly CategoryRule[];
 }): MappedAuditedCardRow[] {
-  const { audited, targetCard, existingTransactions } = params;
+  const { audited, targetCard, existingTransactions, categoryRules = [] } = params;
 
   const cardExisting = existingTransactions.filter(
     (t) =>
@@ -553,7 +558,11 @@ export function mapAuditedInvoiceToCardRows(params: {
   const existingKeys = new Set(
     existingTransactions.map((t) => t.idempotencyKey).filter(Boolean) as string[]
   );
+  const existingImportHashes = new Set(
+    cardExisting.map((t) => t.import_hash).filter(Boolean) as string[]
+  );
   const seenInBatch = new Set<string>();
+  const seenHashesInBatch = new Set<string>();
 
   return audited.transacoes.map((tx, idx) => {
     const isReversal = tx.valor < 0;
@@ -584,7 +593,15 @@ export function mapAuditedInvoiceToCardRows(params: {
       h = Math.imul(h, 16777619);
     }
     const idempotencyKey = `card-audit-${(h >>> 0).toString(16)}`;
+    const importHash = computeCardImportHash({
+      cardId: targetCard.id,
+      date: tx.data,
+      amountCents: amountCents as number,
+      cleanDescription: tx.descricao,
+      direction,
+    });
 
+    const dupBySha = existingImportHashes.has(importHash) || seenHashesInBatch.has(importHash);
     const dupByKey = existingKeys.has(idempotencyKey);
     const dupByHeuristic = cardExisting.some(
       (existing) =>
@@ -594,7 +611,20 @@ export function mapAuditedInvoiceToCardRows(params: {
     );
     const dupInside = seenInBatch.has(idempotencyKey);
     seenInBatch.add(idempotencyKey);
-    const isDuplicate = dupByKey || dupByHeuristic || dupInside;
+    seenHashesInBatch.add(importHash);
+    const isDuplicate = dupBySha || dupByKey || dupByHeuristic || dupInside;
+
+    const autoClassified = categorizeTransactionDescription({
+      description: tx.descricao,
+      direction,
+      customRules: [...categoryRules],
+      fallbackCategory: tx.categoria,
+      cardId: targetCard.id,
+    });
+    const resolvedCategory = autoClassified.isCustomRule
+      ? autoClassified.category
+      : tx.categoria;
+    const resolvedProfile: EntityId = autoClassified.profile || targetCard.entityId;
 
     return {
       rowId: generateEntityId('acrow'),
@@ -606,7 +636,7 @@ export function mapAuditedInvoiceToCardRows(params: {
       amountCents,
       amount: fromCents(amountCents),
       direction,
-      category: tx.categoria,
+      category: resolvedCategory,
       operationType: cardEntryKind === 'FEE' ? 'TARIFA' : 'CARTAO',
       cardEntryKind,
       installmentCurrent: isInstallment ? tx.parcela_atual : undefined,
@@ -615,15 +645,20 @@ export function mapAuditedInvoiceToCardRows(params: {
       parcelaAtual: tx.parcela_atual,
       totalParcelas: tx.total_parcelas,
       auditedCategory: tx.categoria,
+      profile: resolvedProfile,
+      importHash,
+      import_hash: importHash,
       idempotencyKey,
       isDuplicate,
-      duplicateReason: dupByKey
-        ? 'Lançamento já auditado neste cartão'
-        : dupByHeuristic
-          ? 'Compra equivalente já lançada nesta data'
-          : dupInside
-            ? 'Linha duplicada nesta fatura'
-            : undefined,
+      duplicateReason: dupBySha
+        ? 'Já importado (SHA-256 idempotente)'
+        : dupByKey
+          ? 'Lançamento já auditado neste cartão'
+          : dupByHeuristic
+            ? 'Compra equivalente já lançada nesta data'
+            : dupInside
+              ? 'Linha duplicada nesta fatura'
+              : undefined,
       hasValidationError: amountCents <= 0,
       validationError: amountCents <= 0 ? 'Valor zerado ou inválido' : undefined,
       selected: !isDuplicate && amountCents > 0,
@@ -649,10 +684,41 @@ export function buildAuditedCardTransactions(params: {
   const existingKeys = new Set(
     existingTransactions.map((t) => t.idempotencyKey).filter(Boolean) as string[]
   );
+  const existingHashes = new Set(
+    existingTransactions.map((t) => t.import_hash).filter(Boolean) as string[]
+  );
+  const existingKeyByTuple = new Set<string>();
+  for (const t of existingTransactions) {
+    if (t.status === 'CANCELLED') continue;
+    if (t.creditCardId === targetCard.id && t.installmentCurrent && t.installmentTotal) {
+      const cleanExistingMerchant = cleanEstablishmentName(t.originalDescription || t.description)
+        .toLowerCase()
+        .replace(/\s+/g, '');
+      existingKeyByTuple.add(
+        `${targetCard.id}|${getTransactionAmountCents(t)}|${cleanExistingMerchant}|${t.installmentCurrent}/${t.installmentTotal}`
+      );
+    }
+  }
+
   const out: Omit<Transaction, 'id'>[] = [];
 
   for (const row of rows) {
     if (!row.selected || row.hasValidationError || row.amountCents <= 0) continue;
+
+    const cleanMerchant = cleanEstablishmentName(row.description);
+    const rowHash =
+      row.importHash ||
+      row.import_hash ||
+      computeCardImportHash({
+        cardId: targetCard.id,
+        date: row.postingDate || row.date,
+        amountCents: row.amountCents as number,
+        cleanDescription: cleanMerchant,
+        direction: row.direction,
+      });
+
+    if (existingHashes.has(rowHash)) continue;
+    existingHashes.add(rowHash);
 
     const baseDate = row.postingDate || row.date;
     const baseCycle = computeBillingCycleDates(
@@ -665,11 +731,11 @@ export function buildAuditedCardTransactions(params: {
       (row.totalParcelas > 1 || (row.installmentTotal ?? 1) > 1);
     const curParc = row.installmentCurrent || row.parcelaAtual || 1;
     const totParc = row.installmentTotal || row.totalParcelas || 1;
-    const cleanMerchant = cleanEstablishmentName(row.description);
     const groupId = isInstallment ? generateEntityId('cinst-audit') : undefined;
+    const resolvedEntity: EntityId = row.profile || targetCard.entityId;
 
     out.push({
-      entityId: targetCard.entityId,
+      entityId: resolvedEntity,
       accountId: targetCard.id,
       creditCardId: targetCard.id,
       date: baseDate,
@@ -696,12 +762,13 @@ export function buildAuditedCardTransactions(params: {
       counterparty: cleanMerchant,
       importBatchId,
       idempotencyKey: row.idempotencyKey,
+      import_hash: rowHash,
     });
 
-    // Rule 3 from "Lógica para alimentar os Cards da sua Tela":
-    // Automatically generate future installments (parcela_atual + 1 .. total_parcelas)
+    // Rule 3: Automatically generate future installments (parcela_atual + 1 .. total_parcelas)
     if (generateFutureInstallments && isInstallment && curParc < totParc && groupId) {
       const purchaseOriginalDate = addMonthsLocal(baseDate, -(curParc - 1));
+      const cleanMerchantNorm = cleanMerchant.toLowerCase().replace(/\s+/g, '');
       for (let nextParc = curParc + 1; nextParc <= totParc; nextParc += 1) {
         const monthOffset = nextParc - curParc;
         const futurePostingDate = addMonthsLocal(baseDate, monthOffset);
@@ -710,15 +777,29 @@ export function buildAuditedCardTransactions(params: {
           targetCard.closingDay,
           targetCard.dueDay
         );
-        const futureKey = `card-audit-fut-${targetCard.id}-${purchaseOriginalDate}-${row.amountCents}-${cleanMerchant
-          .toLowerCase()
-          .replace(/\s+/g, '')}-${nextParc}of${totParc}`;
+        const futureHash = computeCardImportHash({
+          cardId: targetCard.id,
+          date: futurePostingDate,
+          amountCents: row.amountCents as number,
+          cleanDescription: cleanMerchant,
+          direction: 'EXPENSE',
+        });
+        const futureKey = `card-audit-fut-${targetCard.id}-${purchaseOriginalDate}-${row.amountCents}-${cleanMerchantNorm}-${nextParc}of${totParc}`;
+        const tupleKey = `${targetCard.id}|${row.amountCents}|${cleanMerchantNorm}|${nextParc}/${totParc}`;
 
-        if (existingKeys.has(futureKey)) continue;
+        if (
+          existingHashes.has(futureHash) ||
+          existingKeys.has(futureKey) ||
+          existingKeyByTuple.has(tupleKey)
+        ) {
+          continue;
+        }
+        existingHashes.add(futureHash);
         existingKeys.add(futureKey);
+        existingKeyByTuple.add(tupleKey);
 
         out.push({
-          entityId: targetCard.entityId,
+          entityId: resolvedEntity,
           accountId: targetCard.id,
           creditCardId: targetCard.id,
           date: futurePostingDate,
@@ -744,12 +825,217 @@ export function buildAuditedCardTransactions(params: {
           counterparty: cleanMerchant,
           importBatchId,
           idempotencyKey: futureKey,
+          import_hash: futureHash,
         });
       }
     }
   }
 
   return out;
+}
+
+export function analyzeCardInstallmentCommitments(params: {
+  transactions: readonly Transaction[];
+  audited?: AuditedInvoiceResult;
+  targetCard?: CreditCard;
+}): {
+  activePlansCount: number;
+  currentCycleInstallmentsCents: MoneyCents;
+  committedFutureBalanceCents: MoneyCents;
+  items: Array<{
+    groupId?: string;
+    description: string;
+    merchant: string;
+    cardId?: string;
+    cardName?: string;
+    purchaseDate?: string;
+    totalContractedCents: MoneyCents;
+    installmentAmountCents: MoneyCents;
+    installmentCurrent: number;
+    installmentTotal: number;
+    remainingInstallments: number;
+    committedFutureBalanceCents: MoneyCents;
+    estimatedEndDate?: string;
+    cycleYm?: string;
+    isProjectedAlready: boolean;
+    hasDuplicateRisk: boolean;
+    warnings: string[];
+  }>;
+} {
+  const { transactions, audited, targetCard } = params;
+  const activeTxs = transactions.filter(
+    (t) =>
+      t.status !== 'CANCELLED' &&
+      (!targetCard || t.creditCardId === targetCard.id || t.accountId === targetCard.id)
+  );
+
+  const items: Array<{
+    groupId?: string;
+    description: string;
+    merchant: string;
+    cardId?: string;
+    cardName?: string;
+    purchaseDate?: string;
+    totalContractedCents: MoneyCents;
+    installmentAmountCents: MoneyCents;
+    installmentCurrent: number;
+    installmentTotal: number;
+    remainingInstallments: number;
+    committedFutureBalanceCents: MoneyCents;
+    estimatedEndDate?: string;
+    cycleYm?: string;
+    isProjectedAlready: boolean;
+    hasDuplicateRisk: boolean;
+    warnings: string[];
+  }> = [];
+
+  let currentCycleInstallments = 0;
+  let committedFutureTotal = 0;
+  const seenPlans = new Set<string>();
+
+  if (audited) {
+    for (const tx of audited.transacoes) {
+      if (tx.valor < 0) continue;
+      if (tx.tipo !== 'parcelada' && tx.total_parcelas <= 1) continue;
+
+      const merchant = cleanEstablishmentName(tx.descricao);
+      const instAmt = toCents(Math.abs(tx.valor)) as number;
+      const totParc = Math.max(1, tx.total_parcelas);
+      const curParc = Math.max(1, tx.parcela_atual);
+      const warnings: string[] = [];
+      if (curParc > totParc) {
+        warnings.push(`Parcela atual (${curParc}) excede total (${totParc}).`);
+      }
+
+      const remaining = Math.max(0, totParc - curParc);
+      const totalContracted = instAmt * totParc;
+      const committedFuture = instAmt * remaining;
+      const purchaseDate = addMonthsLocal(tx.data, -(curParc - 1));
+      const estimatedEndDate = addMonthsLocal(tx.data, remaining);
+      const normMerch = merchant.toLowerCase().replace(/\s+/g, '');
+
+      const planKey = `${normMerch}|${instAmt}|${totParc}`;
+      const hasDupInAudited = seenPlans.has(planKey);
+      if (hasDupInAudited) {
+        warnings.push('Possível parcelamento repetido na mesma fatura.');
+      }
+      seenPlans.add(planKey);
+
+      const projectedCount = activeTxs.filter(
+        (existing) =>
+          existing.installmentTotal === totParc &&
+          (existing.installmentCurrent || 0) > curParc &&
+          getTransactionAmountCents(existing) === instAmt &&
+          cleanEstablishmentName(existing.originalDescription || existing.description)
+            .toLowerCase()
+            .replace(/\s+/g, '') === normMerch
+      ).length;
+
+      const existingSameCycle = activeTxs.some(
+        (existing) =>
+          existing.installmentTotal === totParc &&
+          existing.installmentCurrent === curParc &&
+          getTransactionAmountCents(existing) === instAmt &&
+          cleanEstablishmentName(existing.originalDescription || existing.description)
+            .toLowerCase()
+            .replace(/\s+/g, '') === normMerch
+      );
+
+      if (projectedCount > remaining) {
+        warnings.push('Sobreposição de parcelas futuras detectada no histórico.');
+      }
+      if (existingSameCycle) {
+        warnings.push(`Parcela ${curParc}/${totParc} já registrada no cartão.`);
+      }
+
+      currentCycleInstallments += instAmt;
+      committedFutureTotal += committedFuture;
+
+      items.push({
+        description: `${merchant} (${curParc}/${totParc})`,
+        merchant,
+        cardId: targetCard?.id,
+        cardName: targetCard?.cardName,
+        purchaseDate,
+        totalContractedCents: cents(totalContracted),
+        installmentAmountCents: cents(instAmt),
+        installmentCurrent: curParc,
+        installmentTotal: totParc,
+        remainingInstallments: remaining,
+        committedFutureBalanceCents: cents(committedFuture),
+        estimatedEndDate,
+        cycleYm: targetCard
+          ? computeBillingCycleDates(tx.data, targetCard.closingDay, targetCard.dueDay).cycleYm
+          : undefined,
+        isProjectedAlready: remaining > 0 && projectedCount >= remaining,
+        hasDuplicateRisk: hasDupInAudited || existingSameCycle || projectedCount > remaining,
+        warnings,
+      });
+    }
+  } else {
+    // Analyze existing installment plans from confirmed/pending card transactions
+    const groups = new Map<string, Transaction[]>();
+    for (const t of activeTxs) {
+      if ((t.installmentTotal ?? 1) <= 1) continue;
+      const normMerch = cleanEstablishmentName(t.originalDescription || t.description)
+        .toLowerCase()
+        .replace(/\s+/g, '');
+      const key =
+        t.installmentGroupId ||
+        `${t.creditCardId || t.accountId}|${normMerch}|${getTransactionAmountCents(t)}|${t.installmentTotal}`;
+      const list = groups.get(key) || [];
+      list.push(t);
+      groups.set(key, list);
+    }
+
+    for (const [groupId, list] of groups.entries()) {
+      list.sort((a, b) => (a.installmentCurrent || 1) - (b.installmentCurrent || 1));
+      const confirmed = list.filter((t) => t.status === 'CONFIRMED');
+      const pending = list.filter((t) => t.status === 'PENDING');
+      const anchor = confirmed[confirmed.length - 1] || list[0];
+      const instAmt = getTransactionAmountCents(anchor);
+      const totParc = anchor.installmentTotal || 1;
+      const curParc = anchor.installmentCurrent || 1;
+      const remaining = Math.max(0, totParc - curParc);
+      const committedFuture = pending.reduce((acc, p) => acc + getTransactionAmountCents(p), 0) || instAmt * remaining;
+      const lastTx = list[list.length - 1];
+      const merchant = cleanEstablishmentName(anchor.originalDescription || anchor.description);
+      const warnings: string[] = [];
+      if (pending.length > remaining) {
+        warnings.push('Parcelas futuras pendentes excedem parcelas restantes.');
+      }
+
+      currentCycleInstallments += instAmt;
+      committedFutureTotal += committedFuture;
+
+      items.push({
+        groupId,
+        description: anchor.description,
+        merchant,
+        cardId: anchor.creditCardId || targetCard?.id,
+        cardName: targetCard?.cardName || anchor.account,
+        purchaseDate: anchor.purchaseDate || anchor.date,
+        totalContractedCents: cents(instAmt * totParc),
+        installmentAmountCents: cents(instAmt),
+        installmentCurrent: curParc,
+        installmentTotal: totParc,
+        remainingInstallments: remaining,
+        committedFutureBalanceCents: cents(committedFuture),
+        estimatedEndDate: addMonthsLocal(lastTx.date, Math.max(0, totParc - (lastTx.installmentCurrent || curParc))),
+        cycleYm: anchor.billingCycleYm,
+        isProjectedAlready: pending.length >= remaining,
+        hasDuplicateRisk: pending.length > remaining,
+        warnings,
+      });
+    }
+  }
+
+  return {
+    activePlansCount: items.length,
+    currentCycleInstallmentsCents: cents(currentCycleInstallments),
+    committedFutureBalanceCents: cents(committedFutureTotal),
+    items,
+  };
 }
 
 export async function fileOrBufferToBase64(buffer: ArrayBuffer): Promise<string> {

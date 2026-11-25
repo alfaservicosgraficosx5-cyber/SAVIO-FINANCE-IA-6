@@ -1,13 +1,19 @@
 import type { Account, CategoryRule, CreditCard, Transaction } from '../../types';
 import type {
   AccountExtensionMeta,
+  AuditLifecycleStatus,
+  BatchCorrectionRecord,
+  ConfidenceBreakdown,
   CsvColumnMapping,
   ExtractedMovement,
   ExtractionBatch,
   ExtractionFileFormat,
+  ExtractionMethodTag,
   ExtractionRule,
   ExtractionStage,
+  IncrementalSyncSummary,
   InstitutionProfile,
+  MovementSyncState,
   ParseResultPayload,
 } from '../../types-sub/extractions';
 import { cents } from '../money/money';
@@ -19,6 +25,7 @@ import { fileStorageService } from '../../services/fileStorage';
 import {
   computeBufferFingerprint,
   computeFastHash,
+  inspectBufferRealMimeAndSecurity,
   validateExtractionUploadFile,
 } from './fileSecurity';
 import { decodeTextBuffer, parseOfxStatement } from './parsers/ofxParser';
@@ -32,9 +39,18 @@ import {
 } from './parsers/pdfAndImageParser';
 import { identifySourceAccount } from './accountIdentifier';
 import { classifyExtractedMovement } from './movementClassifier';
-import { evaluateMovementDuplicates } from './duplicationDetector';
+import {
+  buildMovementCompositeFingerprint,
+  evaluateMovementDuplicates,
+} from './duplicationDetector';
 import { computeStatementBalanceSummary } from './balanceReconciler';
 import { detectBankFromStatementAsync } from './banksRepository';
+import {
+  auditExtractionBatchIntegrity,
+  resolveAuditLifecycleStatus,
+} from './financialIntegrityEngine';
+
+export const EXTRACTION_PARSER_VERSION = 'savio-ext-6.2.0';
 
 export interface ProcessExtractionParams {
   file: File;
@@ -68,6 +84,8 @@ export interface BuildBatchFromParseParams {
   accountExtensions: AccountExtensionMeta[];
   categoryRules: CategoryRule[];
   extractionRules: ExtractionRule[];
+  reimportOfBatchId?: string;
+  existingCorrections?: BatchCorrectionRecord[];
   onStageChange?: (stage: ExtractionStage) => void;
 }
 
@@ -82,6 +100,21 @@ function blobToBase64Pure(blob: Blob): Promise<string> {
     reader.onerror = () => reject(reader.error || new Error('Falha ao ler arquivo em base64.'));
     reader.readAsDataURL(blob);
   });
+}
+
+function resolveExtractionMethod(
+  parseResult: ParseResultPayload,
+  detectedProfile?: string
+): ExtractionMethodTag {
+  if (parseResult.parseSource === 'OCR_IA') return 'OCR_IA';
+  if (parseResult.format === 'PDF') return 'PDFJS_TEXT';
+  if (
+    detectedProfile &&
+    /(bb_|banco_do_brasil|nubank|inter|99pay|rico)/i.test(detectedProfile)
+  ) {
+    return 'BANK_DEDICATED_PARSER';
+  }
+  return 'LOCAL_PARSER';
 }
 
 export function buildExtractionBatchFromParseResult(
@@ -102,6 +135,8 @@ export function buildExtractionBatchFromParseResult(
     accountExtensions,
     categoryRules,
     extractionRules,
+    reimportOfBatchId: explicitReimportId,
+    existingCorrections,
     onStageChange,
   } = params;
 
@@ -123,6 +158,23 @@ export function buildExtractionBatchFromParseResult(
   const confirmedCard = creditCards.find((c) => c.id === targetCardId);
   const resolvedEntityId =
     identifiedAccount.holderNature || confirmedAcc?.entityId || confirmedCard?.entityId;
+
+  const bankScore =
+    identifiedAccount.detectionConfidence === 'alta'
+      ? 0.95
+      : identifiedAccount.detectionConfidence === 'media'
+        ? 0.75
+        : 0.45;
+  const accountScore =
+    identifiedAccount.matchedAccountId || identifiedAccount.matchedCardId
+      ? 0.94
+      : identifiedAccount.requiresConfirmation
+        ? 0.45
+        : 0.85;
+
+  const previousSameFileBatch = previousBatches.find(
+    (b) => b.status !== 'CANCELADO' && b.id !== batchId && b.contentFingerprint === contentFingerprint
+  );
 
   onStageChange?.('classificacao');
 
@@ -154,6 +206,19 @@ export function buildExtractionBatchFromParseResult(
       existingDoubtReason: row.doubtReason,
     });
 
+    const compositeFingerprint = buildMovementCompositeFingerprint({
+      institutionId: identifiedAccount.institutionId,
+      institutionName: identifiedAccount.bankName,
+      targetAccountId: targetAccountId || targetCardId,
+      date: effectiveDate,
+      amountCents: absCents,
+      direction,
+      movementType: cls.movementType,
+      normalizedDescription: normDesc,
+      bankTransactionId: row.bankTransactionId,
+      currency: row.currency || 'BRL',
+    });
+
     const idempotencyKey = row.bankTransactionId
       ? `ext-${identifiedAccount.institutionId || 'inst'}-${row.bankTransactionId}`
       : `ext-${computeFastHash(
@@ -169,10 +234,20 @@ export function buildExtractionBatchFromParseResult(
 
     const needsId = cls.needsIdentification || !row.date || absCents <= 0;
 
+    const baseConfidenceBreakdown: ConfidenceBreakdown = {
+      ...(parseResult.parseSource === 'OCR_IA' ? { ocr: row.confidence ?? 0.7 } : {}),
+      extraction: row.confidence ?? (parseResult.parseSource === 'LOCAL' ? 0.94 : 0.75),
+      bankDetection: bankScore,
+      accountMatch: accountScore,
+      classification: cls.confidence,
+      duplication: 0.95,
+    };
+
     return {
       id: generateEntityId('mov'),
       batchId,
       bankTransactionId: row.bankTransactionId,
+      compositeFingerprint,
       institutionName: identifiedAccount.bankName,
       sourceFormat: parseResult.format,
       sourceFileName: fileName,
@@ -195,8 +270,12 @@ export function buildExtractionBatchFromParseResult(
       matchedRuleId: cls.matchedRuleId,
       matchedRuleKeyword: cls.matchedRuleKeyword,
       confidence: cls.confidence,
+      confidenceBreakdown: baseConfidenceBreakdown,
+      classificationRationale: cls.rationale,
       doubtReason: doubtReasons || undefined,
+      syncState: !row.date || absCents <= 0 ? 'INVALID' : needsId ? 'NEEDS_REVIEW' : 'NEW',
       duplicateStatus: 'INEDITA',
+      duplicateLayer: 'NONE',
       reviewStatus: needsId ? 'PRECISA_IDENTIFICACAO' : 'PENDENTE',
       rawRowSnapshot: row.rawRowSnapshot,
       manualCorrections: [],
@@ -216,9 +295,7 @@ export function buildExtractionBatchFromParseResult(
           timestamp: nowIso,
           stage: 'CLASSIFICAÇÃO',
           actor: 'SISTEMA',
-          detail: `Classificado como ${cls.movementType} · categoria "${cls.suggestedCategory}" (confiança ${Math.round(
-            cls.confidence * 100
-          )}%).`,
+          detail: `Classificado como ${cls.movementType} · categoria "${cls.suggestedCategory}" (${cls.rationale.reason}).`,
         },
       ],
     };
@@ -226,7 +303,7 @@ export function buildExtractionBatchFromParseResult(
 
   onStageChange?.('duplicidades');
 
-  const evaluatedMovements = draftMovements.map((mov) => {
+  const evaluatedMovements: ExtractedMovement[] = draftMovements.map((mov) => {
     const dup = evaluateMovementDuplicates({
       movement: mov,
       existingTransactions: transactions,
@@ -240,13 +317,27 @@ export function buildExtractionBatchFromParseResult(
         ? 'DUPLICIDADE'
         : mov.reviewStatus;
 
+    const effectiveSyncState: MovementSyncState =
+      mov.syncState === 'INVALID'
+        ? 'INVALID'
+        : dup.syncState === 'NEW' && mov.reviewStatus === 'PRECISA_IDENTIFICACAO'
+          ? 'NEEDS_REVIEW'
+          : dup.syncState;
+
     return {
       ...mov,
+      syncState: effectiveSyncState,
+      updatedSourceDiff: dup.updatedSourceDiff,
       duplicateStatus: dup.classification,
+      duplicateLayer: dup.layer,
+      duplicateRelatedKind: dup.relatedKind,
       duplicateMatchTxId: dup.matchTxId,
       duplicateMatchBatchId: dup.matchBatchId,
       duplicateMatchReason: dup.matchReason,
       transferCounterpartAccountId: dup.transferCounterpartAccountId,
+      confidenceBreakdown: mov.confidenceBreakdown
+        ? { ...mov.confidenceBreakdown, duplication: dup.duplicationConfidence }
+        : undefined,
       reviewStatus: nextReviewStatus,
       lineage:
         dup.classification !== 'INEDITA'
@@ -273,9 +364,31 @@ export function buildExtractionBatchFromParseResult(
     blockedBalanceCents: parseResult.blockedBalanceCents,
   });
 
-  const periodDates = evaluatedMovements.map((m) => m.date).filter(Boolean).sort();
+  const incrementalSummary: IncrementalSyncSummary = {
+    totalAnalyzed: evaluatedMovements.length,
+    newCount: evaluatedMovements.filter((m) => m.syncState === 'NEW').length,
+    existingCount: evaluatedMovements.filter((m) => m.syncState === 'EXISTING').length,
+    possibleDuplicateCount: evaluatedMovements.filter(
+      (m) => m.syncState === 'POSSIBLE_DUPLICATE'
+    ).length,
+    updatedSourceCount: evaluatedMovements.filter((m) => m.syncState === 'UPDATED_SOURCE').length,
+    needsReviewCount: evaluatedMovements.filter((m) => m.syncState === 'NEEDS_REVIEW').length,
+    invalidCount: evaluatedMovements.filter((m) => m.syncState === 'INVALID').length,
+    reimportedFileDetected: Boolean(previousSameFileBatch),
+    previousBatchId: previousSameFileBatch?.id,
+  };
 
-  return {
+  const warnings = [...parseResult.warnings];
+  if (previousSameFileBatch) {
+    warnings.push(
+      `Reimportação segura detectada: o arquivo "${fileName}" já foi processado anteriormente em ${new Date(
+        previousSameFileBatch.importedAt
+      ).toLocaleString('pt-BR')}. Registros existentes foram preservados sem duplicação.`
+    );
+  }
+
+  const periodDates = evaluatedMovements.map((m) => m.date).filter(Boolean).sort();
+  const baseBatch: ExtractionBatch = {
     id: batchId,
     fileName,
     format: parseResult.format,
@@ -286,17 +399,46 @@ export function buildExtractionBatchFromParseResult(
     periodStart: parseResult.periodStart || periodDates[0],
     periodEnd: parseResult.periodEnd || periodDates[periodDates.length - 1],
     stage: 'conferencia',
-    status: parseResult.errors.length > 0 && evaluatedMovements.length === 0 ? 'ERRO' : 'AGUARDANDO_REVISAO',
+    status:
+      parseResult.errors.length > 0 && evaluatedMovements.length === 0
+        ? 'ERRO'
+        : 'AGUARDANDO_REVISAO',
+    connectorId: targetCardId ? 'conn-card-invoice' : 'conn-local-statement-files',
+    extractionMethod: resolveExtractionMethod(
+      parseResult,
+      identifiedAccount.detectedStatementProfile
+    ),
+    parserVersion: EXTRACTION_PARSER_VERSION,
+    reimportOfBatchId: explicitReimportId || previousSameFileBatch?.id,
+    incrementalSummary,
+    correctionsHistory: existingCorrections || [],
     identifiedAccount,
     confirmedAccountId: targetAccountId,
     confirmedCardId: targetCardId,
     confirmedInstitutionId: identifiedAccount.institutionId,
     confirmedEntityId: resolvedEntityId,
     balanceSummary,
-    warnings: parseResult.warnings,
+    warnings,
     errors: parseResult.errors,
     parseSource: parseResult.parseSource,
     movements: evaluatedMovements,
+  };
+
+  const integrityAudit = auditExtractionBatchIntegrity({
+    batch: baseBatch,
+    accounts,
+    creditCards,
+    transactions,
+  });
+  const auditLifecycleStatus: AuditLifecycleStatus = resolveAuditLifecycleStatus(
+    baseBatch,
+    integrityAudit
+  );
+
+  return {
+    ...baseBatch,
+    integrityAudit,
+    auditLifecycleStatus,
   };
 }
 
@@ -336,6 +478,13 @@ export async function processExtractionFile(
   const buffer = await file.arrayBuffer();
   checkAbort();
 
+  const signatureCheck = inspectBufferRealMimeAndSecurity(buffer, format);
+  if (!signatureCheck.ok) {
+    throw new Error(
+      signatureCheck.error || 'O conteúdo interno do arquivo não corresponde ao formato declarado.'
+    );
+  }
+
   const contentFingerprint = await computeBufferFingerprint(buffer, file.name);
   const batchId = generateEntityId('bat');
   const fileDocId = `extdoc-${batchId}`;
@@ -348,7 +497,7 @@ export async function processExtractionFile(
       await fileStorageService.saveRawBlob(
         fileDocId,
         file,
-        file.type || 'application/octet-stream',
+        file.type || signatureCheck.detectedMime || 'application/octet-stream',
         file.name
       );
     }
@@ -384,6 +533,9 @@ export async function processExtractionFile(
     checkAbort();
     headerSample = localExtracted.text.slice(0, 4000);
     const localResult = parseTextualPdfContent(localExtracted.text, file.name);
+    if (localExtracted.pageCountExceeded && localExtracted.pageLimitError) {
+      localResult.warnings.push(localExtracted.pageLimitError);
+    }
     if (localResult.rows.length > 0 || !allowRemoteOcr) {
       parseResult = localResult;
       if (localResult.rows.length === 0 && !allowRemoteOcr) {
@@ -402,6 +554,9 @@ export async function processExtractionFile(
         format: 'PDF',
         signal,
       });
+      if (localExtracted.pageCountExceeded && localExtracted.pageLimitError) {
+        parseResult.warnings.push(localExtracted.pageLimitError);
+      }
     }
   } else {
     // IMAGE

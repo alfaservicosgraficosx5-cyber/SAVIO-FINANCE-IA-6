@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { isOriginAllowedForAi } from '../../server/aiGuard';
+import { isOriginAllowedForAi, resolveVerifiedInlineData } from '../../server/aiGuard';
 import {
   createVaultWithPin,
   disableVaultWithPin,
@@ -240,5 +240,48 @@ describe('Auditoria de Arquitetura e Segurança Financeira', () => {
     expect(pct[0].cdb).toBe(0);
     expect(pct[2].cdi).toBe(1.12);
     expect(pct[2].cdb).toBe(1.29);
+  });
+
+  it('resolveVerifiedInlineData detecta MIME real pelos magic bytes (evita 400 em PNG comprimido para JPEG e rejeita PDF criptografado)', () => {
+    // JPEG bytes originally uploaded as a .png screenshot
+    const jpegBytes = Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0x4a, 0x46, 0x49, 0x46]).toString('base64');
+    const resolvedJpg = resolveVerifiedInlineData(
+      { mimeType: 'image/jpg', base64: jpegBytes },
+      'captura_fatura.png'
+    );
+    expect(resolvedJpg.ok).toBe(true);
+    if (resolvedJpg.ok) {
+      expect(resolvedJpg.mimeType).toBe('image/jpeg');
+    }
+
+    // PNG bytes with data URL prefix
+    const pngBytes = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]).toString('base64');
+    const resolvedPng = resolveVerifiedInlineData(
+      { mimeType: 'image/png', base64: `data:image/png;base64,${pngBytes}` },
+      'recibo.png'
+    );
+    expect(resolvedPng.ok).toBe(true);
+    if (resolvedPng.ok) {
+      expect(resolvedPng.mimeType).toBe('image/png');
+      expect(resolvedPng.base64).toBe(pngBytes);
+    }
+
+    // Valid PDF vs encrypted PDF
+    const cleanPdf = Buffer.from('%PDF-1.7\n1 0 obj\n<< /Type /Catalog >>\nendobj', 'latin1').toString('base64');
+    const resolvedPdf = resolveVerifiedInlineData({ mimeType: 'application/pdf', base64: cleanPdf }, 'extrato.pdf');
+    expect(resolvedPdf.ok).toBe(true);
+
+    const encryptedPdf = Buffer.from('%PDF-1.7\ntrailer << /Encrypt 5 0 R >>', 'latin1').toString('base64');
+    const rejectedEncrypted = resolveVerifiedInlineData({ mimeType: 'application/pdf', base64: encryptedPdf }, 'senha.pdf');
+    expect(rejectedEncrypted.ok).toBe(false);
+    if (!rejectedEncrypted.ok) {
+      expect(rejectedEncrypted.status).toBe(422);
+      expect(rejectedEncrypted.error).toContain('senha');
+    }
+
+    // Disguised non-image/non-PDF payload
+    const badText = Buffer.from('<html>not a pdf</html>', 'utf8').toString('base64');
+    const rejectedBad = resolveVerifiedInlineData({ mimeType: 'application/pdf', base64: badText }, 'falso.pdf');
+    expect(rejectedBad.ok).toBe(false);
   });
 });

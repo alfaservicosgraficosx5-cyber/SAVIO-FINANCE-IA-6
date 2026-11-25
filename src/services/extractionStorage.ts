@@ -5,6 +5,7 @@ import type {
   ConsolidationPreferences,
   ExtractionBatch,
   ExtractionRule,
+  FinancialConnectorState,
   InstitutionProfile,
 } from '../types-sub/extractions';
 
@@ -104,4 +105,16 @@ export function loadConsolidationPreferences(): ConsolidationPreferences {
 
 export function saveConsolidationPreferences(prefs: ConsolidationPreferences): void {
   saveJsonSafe(STORAGE_KEYS.consolidationPrefs, prefs);
+}
+
+export function loadConnectorStates(): FinancialConnectorState[] {
+  return loadJsonWithRecovery<FinancialConnectorState[]>(
+    STORAGE_KEYS.connectorStates,
+    [],
+    (v) => Array.isArray(v)
+  ).data;
+}
+
+export function saveConnectorStates(states: FinancialConnectorState[]): void {
+  saveJsonSafe(STORAGE_KEYS.connectorStates, states);
 }

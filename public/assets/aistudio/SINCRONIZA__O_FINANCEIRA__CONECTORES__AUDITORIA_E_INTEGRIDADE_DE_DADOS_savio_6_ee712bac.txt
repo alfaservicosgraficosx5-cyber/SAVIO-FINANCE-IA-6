@@ -1,0 +1,524 @@
+# PROJETO: EVOLUÇÃO DO SÁVIO FINANCE IA 6
+## SINCRONIZAÇÃO FINANCEIRA, CONECTORES, AUDITORIA E INTEGRIDADE DE DADOS
+
+Atue como um engenheiro de software sênior, arquiteto full-stack, especialista em TypeScript, React, Node.js, bancos de dados, sistemas financeiros, processamento de extratos, conciliação bancária, segurança e automação de importações.
+
+Sua missão é ATUALIZAR o sistema existente Sávio Finance IA 6 de forma cirúrgica, aproveitando conceitos e funcionalidades do projeto de referência `AutomacaoExtratoGerFinan`, sem copiar indiscriminadamente seu código antigo.
+
+O projeto principal deve continuar sendo o Sávio Finance IA 6.
+
+---
+
+# 1. OBJETIVO DA ATUALIZAÇÃO
+
+Evoluir o sistema financeiro para permitir:
+
+- Importação inteligente de extratos.
+- Atualização incremental de movimentações.
+- Reconhecimento de transações já importadas.
+- Identificação de novos lançamentos.
+- Centralização de contas bancárias e cartões.
+- Auditoria de extratos e faturas.
+- Conciliação de saldos.
+- Controle de duplicidades.
+- Gestão de parcelamentos e compromissos futuros.
+- Sugestões inteligentes de categorias.
+- Histórico de importações e sincronizações.
+- Rastreamento de erros e correções.
+- Preparação para conectores bancários autorizados no futuro.
+
+A atualização deve aumentar a confiabilidade, segurança e capacidade de automação do sistema.
+
+---
+
+# 2. REGRA ABSOLUTA: NÃO RECONSTRUIR O SISTEMA
+
+Antes de escrever ou alterar qualquer código:
+
+1. Inspecione toda a estrutura atual do repositório.
+2. Identifique a tecnologia utilizada.
+3. Identifique o banco de dados.
+4. Identifique a arquitetura atual de frontend e backend.
+5. Identifique os serviços de extração bancária.
+6. Identifique os serviços de auditoria de cartão de crédito.
+7. Identifique o sistema de categorização.
+8. Identifique as funções de importação e integração.
+9. Identifique as tabelas, schemas e modelos de movimentações.
+10. Identifique os componentes de interface existentes.
+11. Identifique os testes automatizados.
+12. Identifique os mecanismos de backup, logs e recuperação.
+
+Preserve os componentes que já estão funcionando.
+
+Não remova funcionalidades.
+
+Não substitua serviços existentes sem comprovar a necessidade.
+
+Não altere regras financeiras existentes sem analisar seus efeitos sobre os dados já cadastrados.
+
+Não faça migração destrutiva.
+
+Não recrie tabelas que já possuem equivalente.
+
+Não duplique serviços ou parsers.
+
+Antes de modificar arquivos, apresente um diagnóstico objetivo e um plano de alterações.
+
+---
+
+# 3. APROVEITAMENTO DO PROJETO DE REFERÊNCIA
+
+Utilize o projeto `AutomacaoExtratoGerFinan` como referência conceitual para:
+
+- Sincronização incremental.
+- Histórico de extratos.
+- Identificação de transações novas.
+- Comparação entre importações anteriores e atuais.
+- Organização das fontes por conta bancária.
+- Geração e intercâmbio de OFX.
+- Registro de processamento.
+- Resumo de importações.
+- Separação de coleta, processamento e integração.
+
+Não copie diretamente:
+
+- Armazenamento de senha bancária em arquivos JSON.
+- Automação de login bancário baseada em credenciais salvas.
+- Seletores Selenium frágeis.
+- Dependência de posições de tabelas ou elementos de páginas.
+- IDs financeiros baseados em `GetHashCode()`.
+- Valores monetários usando `double`.
+- Código C# que não seja compatível com a arquitetura do sistema principal.
+
+Reimplemente os conceitos em compatibilidade com a stack e arquitetura atual do Sávio Finance IA.
+
+---
+
+# 4. FASE 1 — SINCRONIZAÇÃO INCREMENTAL
+
+Criar ou evoluir o mecanismo de sincronização de movimentações financeiras.
+
+O sistema deve comparar cada novo arquivo, extrato ou lote com movimentações previamente importadas.
+
+## 4.1 Identificação de movimentações
+
+Prioridade para identificar uma movimentação:
+
+1. ID original da transação fornecido pelo banco.
+2. Identificador único presente no OFX.
+3. Identificador nativo da fonte.
+4. Fingerprint composto determinístico, caso não exista ID confiável.
+
+A fingerprint deve considerar campos disponíveis e relevantes, como:
+
+- Conta de origem.
+- Instituição.
+- Data da transação.
+- Valor.
+- Tipo de movimentação.
+- Descrição normalizada.
+- Identificador de origem.
+- Referência bancária.
+- Moeda.
+
+Não utilizar somente data, valor e descrição como chave definitiva.
+
+Não considerar duas transações iguais automaticamente como duplicadas apenas por terem o mesmo valor.
+
+## 4.2 Resultado da comparação
+
+Cada movimentação deve receber um estado de processamento:
+
+- `NEW`: nova movimentação.
+- `EXISTING`: movimentação já importada.
+- `POSSIBLE_DUPLICATE`: possível duplicidade.
+- `UPDATED_SOURCE`: registro cuja informação de origem foi atualizada.
+- `NEEDS_REVIEW`: exige revisão.
+- `INVALID`: registro inválido.
+
+O sistema deve mostrar um resumo:
+
+- Total analisado.
+- Novos registros.
+- Registros já existentes.
+- Possíveis duplicidades.
+- Registros inválidos.
+- Registros pendentes.
+- Atualizações detectadas.
+
+## 4.3 Reimportação segura
+
+Se o usuário importar o mesmo arquivo novamente:
+
+- Não duplicar os lançamentos.
+- Não duplicar categorias.
+- Não duplicar parcelas.
+- Não duplicar projeções.
+- Não alterar registros confirmados sem justificativa.
+- Registrar que o arquivo já foi processado.
+- Permitir reprocessamento explícito quando necessário.
+
+---
+
+# 5. FASE 2 — CENTRAL DE CONECTORES FINANCEIROS
+
+Criar uma estrutura modular para centralizar as fontes de dados financeiras.
+
+Aproveitar a arquitetura existente e adaptar os módulos ao projeto.
+
+A central deve estar preparada para:
+
+- Importação manual de arquivos.
+- OFX.
+- CSV.
+- PDF.
+- XLSX.
+- XML.
+- JSON.
+- Extratos bancários.
+- Faturas de cartões.
+- Conectores de dados autorizados.
+- Integrações futuras por APIs oficiais ou Open Finance, quando disponíveis e autorizadas.
+
+## 5.1 Arquitetura de conectores
+
+Implementar uma camada de adaptadores sem acoplar os parsers à interface.
+
+Cada conector deverá ser responsável por:
+
+- Identificar a fonte.
+- Validar a entrada.
+- Extrair dados.
+- Normalizar informações.
+- Retornar dados estruturados.
+- Informar erros.
+- Informar limitações.
+- Identificar o período coberto.
+- Registrar o método de obtenção.
+
+Não criar conectores falsos ou simular acesso bancário real.
+
+Não utilizar scraping de bancos sem verificar segurança, autorização e condições de uso.
+
+Não solicitar nem armazenar senhas bancárias em texto puro.
+
+## 5.2 Status dos conectores
+
+Exibir estados como:
+
+- Disponível.
+- Configurado.
+- Aguardando autorização.
+- Importação manual.
+- Última sincronização.
+- Erro de conexão.
+- Fonte não suportada.
+- Desativado.
+
+A conexão com banco deverá ser uma funcionalidade claramente autorizada pelo usuário.
+
+---
+
+# 6. FASE 3 — MOTOR DE AUDITORIA FINANCEIRA
+
+Criar ou fortalecer um serviço central de auditoria.
+
+Nome conceitual sugerido:
+
+`FinancialIntegrityEngine`
+
+Antes de integrar um lote, verificar:
+
+## 6.1 Extrato bancário
+
+- Arquivo válido.
+- Banco identificado ou confirmado.
+- Conta identificada ou confirmada.
+- Titularidade e entidade corretas.
+- Datas válidas.
+- Valores válidos.
+- Créditos identificados.
+- Débitos identificados.
+- Moeda identificada.
+- Saldo inicial reconhecido.
+- Saldo final reconhecido.
+- Movimentações duplicadas avaliadas.
+- Transferências internas reconhecidas.
+- Dados de origem preservados.
+
+## 6.2 Conciliação matemática
+
+Utilizar decimal ou unidades inteiras de centavos, conforme a arquitetura atual.
+
+Nunca utilizar `float` ou `double` como base de cálculos financeiros sem uma estratégia explícita de precisão.
+
+Equação:
+
+Saldo final esperado = Saldo inicial + Créditos - Débitos
+
+Diferença de conciliação = Saldo final informado - Saldo final calculado
+
+Se houver divergência:
+
+- Registrar o valor da diferença.
+- Registrar os valores utilizados.
+- Identificar o tipo da inconsistência.
+- Exibir alerta.
+- Não corrigir o saldo automaticamente.
+- Não inventar lançamentos para fechar a diferença.
+
+## 6.3 Auditoria de faturas de cartão
+
+Verificar:
+
+- Total da fatura informado.
+- Somatório de compras.
+- Parcelamentos.
+- Estornos.
+- Reembolsos.
+- Cashback.
+- Tarifas.
+- Anuidade.
+- IOF.
+- Juros.
+- Multas.
+- Pagamentos.
+- Créditos.
+- Saldo anterior, quando existir.
+- Vencimento.
+- Fechamento.
+- Ciclo da fatura.
+
+O valor do documento e o valor calculado não devem ser sobrescritos para forçar igualdade.
+
+Se houver divergência, gerar ocorrência de auditoria.
+
+---
+
+# 7. FASE 4 — PARCELAMENTOS E COMPROMISSOS FUTUROS
+
+Fortalecer o controle de compras parceladas.
+
+Diferenciar obrigatoriamente:
+
+- Valor total contratado.
+- Valor da parcela.
+- Parcela atual.
+- Quantidade total de parcelas.
+- Parcelas restantes.
+- Saldo futuro comprometido.
+- Data estimada de término.
+- Cartão associado.
+- Compra original.
+- Identificador da compra.
+
+Verificar:
+
+- Se a parcela atual está dentro do intervalo.
+- Se o valor foi interpretado corretamente.
+- Se a compra já existe.
+- Se as parcelas futuras já estão projetadas.
+- Se existe sobreposição de projeções.
+- Se o parcelamento foi importado em mais de uma fatura.
+- Se o ciclo da fatura está correto.
+
+Não gerar parcelas futuras duplicadas.
+
+Não somar o valor total da compra novamente quando as parcelas já estiverem representadas.
+
+---
+
+# 8. FASE 5 — MOTOR DE DUPLICIDADES
+
+Implementar detecção de duplicidades em camadas.
+
+## Duplicidade exata
+
+Identificador original igual, origem igual e registro previamente importado.
+
+## Duplicidade provável
+
+Correspondência de conta, data, valor, descrição normalizada e características da movimentação.
+
+## Duplicidade suspeita
+
+Movimentações semelhantes, mas sem evidência suficiente para exclusão.
+
+## Movimentações relacionadas
+
+Reconhecer situações que não devem ser removidas:
+
+- Compra e estorno.
+- Pagamento e baixa de fatura.
+- Transferência entre contas próprias.
+- Compra parcelada.
+- Compra repetida no mesmo estabelecimento.
+- Crédito e débito correspondentes.
+- Ajuste de saldo.
+
+Nunca excluir automaticamente uma movimentação apenas por similaridade.
+
+Permitir:
+
+- Confirmar duplicidade.
+- Manter ambos.
+- Vincular movimentações.
+- Ignorar alerta.
+- Registrar decisão do usuário.
+
+---
+
+# 9. FASE 6 — CLASSIFICAÇÃO E SUGESTÕES DA IA
+
+A IA deve trabalhar como assistente de classificação, não como autoridade sobre os dados financeiros.
+
+Separar:
+
+- Confiança de OCR.
+- Confiança de extração.
+- Confiança de identificação bancária.
+- Confiança de identificação da conta.
+- Confiança de classificação.
+- Confiança de detecção de duplicidade.
+
+Cada sugestão deve informar:
+
+- Categoria sugerida.
+- Motivo.
+- Evidência.
+- Origem da regra.
+- Score de confiança.
+- Histórico da regra, se houver.
+
+Permitir:
+
+- Aceitar.
+- Editar.
+- Rejeitar.
+- Ignorar.
+- Criar regra futura.
+
+Não alterar saldo por sugestão.
+
+Não converter hipótese em movimentação real.
+
+Não atribuir confiança arbitrária como se fosse probabilidade calibrada.
+
+---
+
+# 10. FASE 7 — HISTÓRICO E RASTREABILIDADE
+
+Criar ou aprimorar o histórico de importações.
+
+Cada lote deve registrar:
+
+- ID da importação.
+- Usuário.
+- Instituição.
+- Conta.
+- Tipo de documento.
+- Nome do arquivo.
+- Hash do arquivo, se aplicável.
+- Data de importação.
+- Período do extrato.
+- Quantidade de registros extraídos.
+- Quantidade de registros novos.
+- Quantidade de registros existentes.
+- Quantidade de duplicidades.
+- Quantidade de erros.
+- Status da auditoria.
+- Status da integração.
+- Resumo da conciliação.
+- Método de extração.
+- Versão do parser.
+- Correções realizadas.
+
+Status sugeridos:
+
+- `UPLOADED`
+- `PROCESSING`
+- `EXTRACTED`
+- `AUDITING`
+- `READY_FOR_REVIEW`
+- `APPROVED`
+- `APPROVED_WITH_WARNINGS`
+- `BLOCKED`
+- `FAILED`
+- `INTEGRATED`
+
+Não remover histórico de importação para esconder erros.
+
+---
+
+# 11. FASE 8 — INTERFACE DO USUÁRIO
+
+Adicionar os novos recursos sem quebrar o layout e os padrões atuais do Sávio Finance IA.
+
+Criar ou evoluir uma central com:
+
+## Resumo
+
+- Extratos importados.
+- Última atualização.
+- Contas conectadas ou fontes cadastradas.
+- Novos lançamentos.
+- Pendências.
+- Divergências.
+- Faturas pendentes de revisão.
+
+## Tela de importação
+
+Exibir:
+
+- Arquivo.
+- Instituição.
+- Conta.
+- Período.
+- Total de lançamentos.
+- Novos lançamentos.
+- Duplicidades.
+- Erros.
+- Conciliação.
+- Confiança.
+- Status.
+
+## Tela de auditoria
+
+Exibir cada problema com:
+
+- Tipo.
+- Gravidade.
+- Valor.
+- Evidência.
+- Explicação.
+- Recomendação.
+- Ação disponível.
+
+A interface deve ser responsiva para desktop, tablet e celular.
+
+Não sobrecarregar o painel.
+
+Manter a identidade visual atual.
+
+---
+
+# 12. FASE 9 — SEGURANÇA
+
+Auditar a segurança da importação.
+
+Implementar ou verificar:
+
+- Limites de tamanho.
+- Limites de páginas.
+- MIME real.
+- Validação de arquivos.
+- Sanitização de conteúdo.
+- Isolamento por usuário.
+- Isolamento de entidades.
+- Proteção de documentos.
+- Segurança de logs.
+- Proteção de CPF/CNPJ.
+- Proteção de agência e conta.
+- Proteção de dados de cartão.
+- Armazenamento seguro.
+- Autoriz

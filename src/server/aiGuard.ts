@@ -232,3 +232,102 @@ export async function withTimeout<T>(promise: Promise<T>, timeoutMs = 25000): Pr
     if (timer) clearTimeout(timer);
   }
 }
+
+export type VerifiedInlineMime = 'application/pdf' | 'image/png' | 'image/jpeg' | 'image/webp';
+
+export type VerifiedInlineDataResult =
+  | { ok: true; mimeType: VerifiedInlineMime; base64: string; byteLength: number }
+  | { ok: false; status: 400 | 422; error: string };
+
+/**
+ * Inspects decoded binary magic bytes so Gemini always receives the TRUE payload MIME type
+ * (preventing 400 INVALID_ARGUMENT when e.g. a `.png` upload was compressed to JPEG on the client)
+ * and rejects encrypted PDFs or corrupted/disguised files before calling upstream AI.
+ */
+export function resolveVerifiedInlineData(
+  fileData: { mimeType: string; base64: string },
+  _fileName = ''
+): VerifiedInlineDataResult {
+  const strippedBase64 = String(fileData.base64 || '')
+    .replace(/^data:[^;]+;base64,/i, '')
+    .replace(/\s+/g, '');
+
+  if (strippedBase64.length < 8) {
+    return {
+      ok: false,
+      status: 422,
+      error: 'Arquivo vazio ou corrompido para leitura visual.',
+    };
+  }
+
+  const buf = Buffer.from(strippedBase64, 'base64');
+  if (buf.length < 4) {
+    return {
+      ok: false,
+      status: 422,
+      error: 'Conteúdo do arquivo inválido ou truncado.',
+    };
+  }
+
+  // 1. PDF signature: "%PDF-" anywhere in the first 32 bytes (allows leading BOM/whitespace)
+  const pdfHead = buf.subarray(0, Math.min(32, buf.length)).toString('ascii');
+  if (pdfHead.includes('%PDF-')) {
+    const rawScan = buf.toString('latin1');
+    if (/\/Encrypt(?:\s+\d+\s+\d+\s+R|\s*<<)/.test(rawScan)) {
+      return {
+        ok: false,
+        status: 422,
+        error:
+          'Este PDF está protegido por senha ou criptografado. Remova a senha do documento ou envie uma imagem/CSV.',
+      };
+    }
+    return {
+      ok: true,
+      mimeType: 'application/pdf',
+      base64: strippedBase64,
+      byteLength: buf.length,
+    };
+  }
+
+  // 2. PNG magic bytes: 89 50 4E 47
+  if (buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47) {
+    return {
+      ok: true,
+      mimeType: 'image/png',
+      base64: strippedBase64,
+      byteLength: buf.length,
+    };
+  }
+
+  // 3. JPEG magic bytes: FF D8 FF
+  if (buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff) {
+    return {
+      ok: true,
+      mimeType: 'image/jpeg',
+      base64: strippedBase64,
+      byteLength: buf.length,
+    };
+  }
+
+  // 4. WEBP magic bytes: RIFF....WEBP
+  if (
+    buf.length >= 12 &&
+    buf.subarray(0, 4).toString('ascii') === 'RIFF' &&
+    buf.subarray(8, 12).toString('ascii') === 'WEBP'
+  ) {
+    return {
+      ok: true,
+      mimeType: 'image/webp',
+      base64: strippedBase64,
+      byteLength: buf.length,
+    };
+  }
+
+  return {
+    ok: false,
+    status: 422,
+    error:
+      'Formato binário não reconhecido para leitura visual. Envie um PDF legítimo ou imagem PNG, JPG ou WEBP.',
+  };
+}
+

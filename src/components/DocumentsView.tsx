@@ -264,22 +264,24 @@ export const DocumentsView: React.FC<DocumentsViewProps> = ({
 
     if (aiBase64 || params.textContent) {
       try {
+        const normalizedMime = finalMime === 'image/jpg' ? 'image/jpeg' : finalMime;
         const res = await fetch('/api/ai/parse-document', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
-            fileName: params.fileName,
-            textContent: params.textContent,
+            fileName: params.fileName.slice(0, 250),
+            ...(params.textContent ? { textContent: params.textContent.slice(0, 30000) } : {}),
             knownAccounts: accounts
               .filter((a) => !a.archived)
+              .slice(0, 40)
               .map((a) => ({
-                institutionName: a.institutionName,
-                accountName: a.accountName,
+                institutionName: a.institutionName.slice(0, 120),
+                accountName: a.accountName.slice(0, 120),
                 entityId: a.entityId,
               })),
             fileData:
-              aiBase64 && /^(application\/pdf|image\/(png|jpeg|jpg|webp))$/.test(finalMime)
-                ? { mimeType: finalMime, base64: aiBase64 }
+              aiBase64 && /^(application\/pdf|image\/(png|jpeg|webp))$/.test(normalizedMime)
+                ? { mimeType: normalizedMime, base64: aiBase64 }
                 : undefined,
           }),
         });
@@ -406,12 +408,17 @@ export const DocumentsView: React.FC<DocumentsViewProps> = ({
 
     try {
       const isImage = file.type.startsWith('image/') || /\.(png|jpe?g|webp)$/i.test(ext);
+      const inferredImageMime = ext.endsWith('.png')
+        ? 'image/png'
+        : ext.endsWith('.webp')
+          ? 'image/webp'
+          : 'image/jpeg';
       // PDFs are stored untouched without compression inside fileStorageService
       const savedMeta = await fileStorageService.saveDocumentFile(
         docId,
         file,
         file.name,
-        isImage ? file.type : file.type || 'application/pdf'
+        isImage ? file.type || inferredImageMime : file.type || 'application/pdf'
       );
 
       await analyzeMultimodal({

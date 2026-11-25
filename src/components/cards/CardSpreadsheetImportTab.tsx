@@ -1,7 +1,8 @@
 import React, { useEffect, useMemo, useState } from 'react';
-import {
+import type {
   CategoryRule,
   CreditCard,
+  EntityId,
   Transaction,
 } from '../../types';
 import {
@@ -29,7 +30,15 @@ import {
   fileOrBufferToBase64,
   mapAuditedInvoiceToCardRows,
   MappedAuditedCardRow,
+  sanitizeAuditedInvoiceResult,
 } from '../../domain/cards/CardInvoiceAuditorService';
+import {
+  buildLearnedClassificationRules,
+  detectInvoiceInstallment,
+  parseBrazilianCardInvoiceOfx,
+  parseBrazilianCardInvoicePdfText,
+} from '../../services/statementImporter';
+import { extractTextFromPdfBufferAsync } from '../../domain/extractions/parsers/pdfAndImageParser';
 import {
   downloadDriveFileArrayBuffer,
   DrivePickedFile,
@@ -41,6 +50,7 @@ import {
   openGoogleDrivePicker,
   signInWithGoogleWorkspace,
 } from '../../services/googleWorkspace';
+import { auditCardInvoiceIntegrity } from '../../domain/extractions/financialIntegrityEngine';
 import { decodeTextBuffer } from '../../domain/extractions/parsers/ofxParser';
 import { fromCents } from '../../domain/money/money';
 import { formatDateBR } from '../../utils/dateUtils';
@@ -49,6 +59,7 @@ import { usePrivacy } from '../../contexts/PrivacyContext';
 import { BankLogo } from '../BankLogo';
 import {
   AlertCircle,
+  AlertTriangle,
   CalendarClock,
   CheckCircle2,
   Cloud,
@@ -73,6 +84,7 @@ interface CardSpreadsheetImportTabProps {
     items: Omit<Transaction, 'id'>[],
     meta: { fileName: string; batchFingerprint: string; cardId: string }
   ) => { acceptedCount: number; skippedDuplicatesCount: number };
+  onUpsertCategoryRules?: (rules: CategoryRule[]) => void;
 }
 
 function inferInvoiceMimeType(fileName: string, rawMime?: string): string {
@@ -95,9 +107,11 @@ function isAuditorFile(fileName: string, rawMime?: string): boolean {
     low.endsWith('.jpeg') ||
     low.endsWith('.webp') ||
     low.endsWith('.csv') ||
+    low.endsWith('.ofx') ||
     mime.includes('pdf') ||
     mime.startsWith('image/') ||
-    mime.includes('csv')
+    mime.includes('csv') ||
+    mime.includes('ofx')
   );
 }
 
@@ -106,6 +120,7 @@ export const CardSpreadsheetImportTab: React.FC<CardSpreadsheetImportTabProps> =
   transactions,
   categoryRules = [],
   onCommitCardImport,
+  onUpsertCategoryRules,
 }) => {
   const { hideValues } = usePrivacy();
   const [sourceMode, setSourceMode] = useState<'AUDITOR' | 'SPREADSHEET' | 'DRIVE'>('AUDITOR');
@@ -180,6 +195,18 @@ export const CardSpreadsheetImportTab: React.FC<CardSpreadsheetImportTabProps> =
   const auditedMetrics = useMemo(
     () => (auditedResult ? computeAuditedCardMetrics(auditedResult) : null),
     [auditedResult]
+  );
+
+  const invoiceAuditReport = useMemo(
+    () =>
+      auditedResult
+        ? auditCardInvoiceIntegrity({
+            audited: auditedResult,
+            card,
+            existingTransactions: transactions,
+          })
+        : null,
+    [auditedResult, card, transactions]
   );
 
   const batchFingerprint = useMemo(() => {
@@ -291,7 +318,46 @@ export const CardSpreadsheetImportTab: React.FC<CardSpreadsheetImportTabProps> =
       return;
     }
 
-    // PDF or Image/Print -> send to server-side Financial Auditor (/api/ai/audit-card-invoice)
+    // OFX: local credit card OFX parser
+    if (lower.endsWith('.ofx') || mime.includes('ofx')) {
+      const ofxText = decodeTextBuffer(buffer);
+      const ofxParsed = parseBrazilianCardInvoiceOfx(ofxText, fileName);
+      setWorkbook(null);
+      setAuditedRawContext(null);
+      setAuditedFileName(fileName);
+      const ofxAudited = sanitizeAuditedInvoiceResult({
+        resumo_fatura: {
+          vencimento: ofxParsed.dueDate,
+          valor_total_identificado: ofxParsed.reportedTotal,
+        },
+        transacoes: ofxParsed.items.map((item) => {
+          const inst = detectInvoiceInstallment(item.description);
+          return {
+            data: item.date,
+            descricao:
+              inst.tipo === 'parcelada'
+                ? `${inst.cleanDescription} (${inst.installmentCurrent}/${inst.installmentTotal})`
+                : inst.cleanDescription,
+            valor: item.amount,
+            tipo: inst.tipo,
+            parcela_atual: inst.installmentCurrent,
+            total_parcelas: inst.installmentTotal,
+            categoria: 'Outros' as const,
+          };
+        }),
+      });
+      setAuditedResult(ofxAudited);
+      if (ofxAudited.transacoes.length === 0) {
+        setErrorMsg(`Nenhuma compra ou estorno identificado no OFX "${fileName}".`);
+      } else {
+        setStatusMsg(
+          `Auditor local leu o OFX "${fileName}": ${ofxAudited.transacoes.length} lançamento(s) identificado(s).`
+        );
+      }
+      return;
+    }
+
+    // PDF (local free text parser first, OCR fallback if scanned) or Image/Print -> OCR
     if (isAuditorFile(fileName, mime)) {
       setWorkbook(null);
       setBusy(true);
@@ -299,6 +365,40 @@ export const CardSpreadsheetImportTab: React.FC<CardSpreadsheetImportTabProps> =
         const base64Data = await fileOrBufferToBase64(buffer);
         setAuditedRawContext({ fileName, mimeType: mime, base64Data });
         setAuditedFileName(fileName);
+
+        if (lower.endsWith('.pdf') || mime.includes('pdf')) {
+          const extractedPdf = await extractTextFromPdfBufferAsync(buffer);
+          const localPdf = parseBrazilianCardInvoicePdfText(extractedPdf.text, fileName);
+          if (localPdf.items.length > 0) {
+            const pdfAudited = sanitizeAuditedInvoiceResult({
+              resumo_fatura: {
+                vencimento: localPdf.dueDate,
+                valor_total_identificado: localPdf.reportedTotal,
+              },
+              transacoes: localPdf.items.map((item) => {
+                const inst = detectInvoiceInstallment(item.description);
+                return {
+                  data: item.date,
+                  descricao:
+                    inst.tipo === 'parcelada'
+                      ? `${inst.cleanDescription} (${inst.installmentCurrent}/${inst.installmentTotal})`
+                      : inst.cleanDescription,
+                  valor: item.amount,
+                  tipo: inst.tipo,
+                  parcela_atual: inst.installmentCurrent,
+                  total_parcelas: inst.installmentTotal,
+                  categoria: 'Outros' as const,
+                };
+              }),
+            });
+            setAuditedResult(pdfAudited);
+            setStatusMsg(
+              `Leitor local extraiu ${pdfAudited.transacoes.length} transação(ões) do PDF "${fileName}" (pagamentos anteriores ignorados).`
+            );
+            return;
+          }
+        }
+
         const aiRes = await auditCardInvoiceDocument({
           fileName,
           mimeType: mime,
@@ -327,7 +427,7 @@ export const CardSpreadsheetImportTab: React.FC<CardSpreadsheetImportTabProps> =
       return;
     }
 
-    setErrorMsg('Formato não suportado. Envie PDF, PNG, JPG, WEBP, CSV ou Excel (.xlsx/.xls).');
+    setErrorMsg('Formato não suportado. Envie PDF, CSV, OFX, PNG, JPG, WEBP ou Excel (.xlsx/.xls).');
   };
 
   const handleLocalFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -519,6 +619,16 @@ export const CardSpreadsheetImportTab: React.FC<CardSpreadsheetImportTabProps> =
         batchFingerprint,
         cardId: card.id,
       });
+      if (onUpsertCategoryRules) {
+        const learned = buildLearnedClassificationRules({
+          rows: auditedRows,
+          cardId: card.id,
+          existingRules: categoryRules,
+        });
+        if (learned.length > 0) {
+          onUpsertCategoryRules(learned);
+        }
+      }
       const futureCount = items.filter((i) => i.status === 'PENDING').length;
       setStatusMsg(
         `Fatura auditada importada em ${card.cardName}: ${res.acceptedCount} registro(s) salvo(s)${
@@ -667,7 +777,7 @@ export const CardSpreadsheetImportTab: React.FC<CardSpreadsheetImportTabProps> =
                   : workbook
                     ? workbook.fileName
                     : sourceMode === 'AUDITOR'
-                      ? 'Importar Fatura (PDF, Print/Imagem PNG/JPG ou CSV)'
+                      ? 'Importar Fatura (PDF, CSV, OFX ou Print PNG/JPG)'
                       : 'Selecionar planilha (.xlsx, .xls, .csv)'}
             </span>
             <span className="text-[11px] text-[#64748B] dark:text-slate-400 mt-1 max-w-lg">
@@ -678,8 +788,8 @@ export const CardSpreadsheetImportTab: React.FC<CardSpreadsheetImportTabProps> =
               disabled={busy}
               accept={
                 sourceMode === 'AUDITOR'
-                  ? '.pdf,.png,.jpg,.jpeg,.webp,.csv,.xlsx,.xls'
-                  : '.xlsx,.xls,.csv,.pdf,.png,.jpg,.jpeg,.webp'
+                  ? '.pdf,.csv,.ofx,.png,.jpg,.jpeg,.webp,.xlsx,.xls'
+                  : '.xlsx,.xls,.csv,.ofx,.pdf,.png,.jpg,.jpeg,.webp'
               }
               onChange={handleLocalFileChange}
               className="hidden"
@@ -847,6 +957,119 @@ export const CardSpreadsheetImportTab: React.FC<CardSpreadsheetImportTabProps> =
               </div>
             </div>
 
+            {/* Phase 3 (6.3) & Phase 4 Invoice Integrity Breakdown & Installment Commitments */}
+            {invoiceAuditReport && (
+              <div className="space-y-3 pt-1">
+                {invoiceAuditReport.hasDivergence && (
+                  <div className="p-3 rounded-xl bg-amber-50 dark:bg-amber-950/50 border border-amber-300 dark:border-amber-700 text-xs text-amber-900 dark:text-amber-200 flex items-start gap-2">
+                    <AlertTriangle size={16} className="shrink-0 mt-0.5" />
+                    <div className="space-y-0.5">
+                      <strong className="block">
+                        Divergência entre Total Informado e Soma Calculada (valores preservados)
+                      </strong>
+                      <span>
+                        Total informado no documento:{' '}
+                        <strong>
+                          {formatarValor(fromCents(invoiceAuditReport.reportedTotalCents), hideValues)}
+                        </strong>{' '}
+                        · Soma calculada:{' '}
+                        <strong>
+                          {formatarValor(fromCents(invoiceAuditReport.calculatedNetCents), hideValues)}
+                        </strong>{' '}
+                        · Diferença:{' '}
+                        <strong>
+                          {formatarValor(fromCents(invoiceAuditReport.divergenceCents), hideValues)}
+                        </strong>
+                        . Nenhum valor foi ajustado artificialmente.
+                      </span>
+                    </div>
+                  </div>
+                )}
+
+                <div className="grid grid-cols-2 sm:grid-cols-5 gap-2 text-[11px]">
+                  {[
+                    { label: 'À vista', centsVal: invoiceAuditReport.purchasesCents },
+                    { label: 'Parceladas', centsVal: invoiceAuditReport.installmentsCents },
+                    { label: 'Tarifas / IOF', centsVal: invoiceAuditReport.feesAndTaxesCents },
+                    { label: 'Juros / Multas', centsVal: invoiceAuditReport.interestAndFinesCents },
+                    { label: 'Estornos / Cashback', centsVal: invoiceAuditReport.reversalsAndCashbackCents },
+                  ].map((item) => (
+                    <div
+                      key={item.label}
+                      className="p-2 rounded-lg bg-slate-50 dark:bg-slate-800/50 border border-slate-200/70 dark:border-slate-700"
+                    >
+                      <span className="block text-[10px] text-slate-500">{item.label}</span>
+                      <strong className="font-money font-bold text-[#0F172A] dark:text-white">
+                        {formatarValor(fromCents(item.centsVal), hideValues)}
+                      </strong>
+                    </div>
+                  ))}
+                </div>
+
+                {invoiceAuditReport.installmentSummary.items.length > 0 && (
+                  <div className="rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50/70 dark:bg-slate-800/40 p-3 space-y-2">
+                    <div className="flex flex-wrap items-center justify-between gap-2 text-xs">
+                      <strong className="text-[#0F172A] dark:text-white">
+                        Compromissos de Parcelamento ({invoiceAuditReport.installmentSummary.activePlansCount})
+                      </strong>
+                      <span className="text-[11px] font-bold text-amber-800 dark:text-amber-300">
+                        Saldo futuro comprometido:{' '}
+                        {formatarValor(
+                          fromCents(invoiceAuditReport.installmentSummary.committedFutureBalanceCents),
+                          hideValues
+                        )}
+                      </span>
+                    </div>
+                    <div className="overflow-x-auto">
+                      <table className="w-full text-[11px] text-left">
+                        <thead className="text-slate-500 border-b border-slate-200 dark:border-slate-700">
+                          <tr>
+                            <th className="py-1 pr-2">Compra</th>
+                            <th className="py-1 px-2">Parcela</th>
+                            <th className="py-1 px-2">Valor parc.</th>
+                            <th className="py-1 px-2">Total contratado</th>
+                            <th className="py-1 px-2">Restantes</th>
+                            <th className="py-1 px-2">Saldo futuro</th>
+                            <th className="py-1 pl-2">Término est.</th>
+                          </tr>
+                        </thead>
+                        <tbody className="divide-y divide-slate-200/70 dark:divide-slate-700/70">
+                          {invoiceAuditReport.installmentSummary.items.map((inst, idx) => (
+                            <tr key={`${inst.description}-${idx}`}>
+                              <td className="py-1.5 pr-2 font-semibold text-[#0F172A] dark:text-white">
+                                <div>{inst.description}</div>
+                                {(inst.hasDuplicateRisk || inst.warnings.length > 0) && (
+                                  <span className="text-[10px] text-amber-700 dark:text-amber-300 font-bold">
+                                    {inst.warnings.join(' ') || 'Projeção já existente protegida contra duplicidade'}
+                                  </span>
+                                )}
+                              </td>
+                              <td className="py-1.5 px-2 tabular-nums">
+                                {inst.installmentCurrent}/{inst.installmentTotal}
+                              </td>
+                              <td className="py-1.5 px-2 font-money tabular-nums">
+                                {formatarValor(fromCents(inst.installmentAmountCents), hideValues)}
+                              </td>
+                              <td className="py-1.5 px-2 font-money tabular-nums">
+                                {formatarValor(fromCents(inst.totalContractedCents), hideValues)}
+                              </td>
+                              <td className="py-1.5 px-2 tabular-nums">{inst.remainingInstallments}</td>
+                              <td className="py-1.5 px-2 font-money tabular-nums">
+                                {formatarValor(fromCents(inst.committedFutureBalanceCents), hideValues)}
+                              </td>
+                              <td className="py-1.5 pl-2">
+                                {inst.estimatedEndDate ? formatDateBR(inst.estimatedEndDate) : '—'}
+                              </td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  </div>
+                )}
+              </div>
+            )}
+
             {showRawJson && (
               <div className="rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-950 text-slate-100 p-3 space-y-2">
                 <div className="flex items-center justify-between">
@@ -968,6 +1191,35 @@ export const CardSpreadsheetImportTab: React.FC<CardSpreadsheetImportTabProps> =
                         </option>
                       ))}
                     </select>
+                    <div className="inline-flex rounded-lg border border-slate-200 dark:border-slate-700 p-0.5 bg-slate-100 dark:bg-slate-800">
+                      {(['CPF', 'CNPJ'] as const).map((prof) => {
+                        const active = (row.profile || card.entityId) === prof;
+                        return (
+                          <button
+                            key={prof}
+                            type="button"
+                            onClick={() =>
+                              setAuditedRows((prev) =>
+                                prev.map((item) =>
+                                  item.rowId === row.rowId
+                                    ? { ...item, profile: prof as EntityId }
+                                    : item
+                                )
+                              )
+                            }
+                            className={`px-2 py-0.5 rounded text-[10px] font-bold cursor-pointer ${
+                              active
+                                ? prof === 'CPF'
+                                  ? 'bg-[#059669] text-white'
+                                  : 'bg-[#061E3E] dark:bg-blue-600 text-white'
+                                : 'text-slate-500 dark:text-slate-400'
+                            }`}
+                          >
+                            {prof}
+                          </button>
+                        );
+                      })}
+                    </div>
                     <span
                       className={`font-money text-xs font-extrabold ${
                         row.direction === 'INCOME'

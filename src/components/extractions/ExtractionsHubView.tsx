@@ -15,12 +15,14 @@ import {
   type AccountExtensionMeta,
   type ConsolidationPreferences,
   type CsvColumnMapping,
+  type DuplicateUserDecision,
   type ExtractedMovement,
   type ExtractionBatch,
   type ExtractionIntegrationCommitResult,
   type ExtractionMovementType,
   type ExtractionRule,
   type ExtractionStage,
+  type FinancialConnectorState,
   type InstitutionCategory,
   type InstitutionProfile,
   type ParseResultPayload,
@@ -33,10 +35,26 @@ import {
 } from '../../domain/extractions/extractionOrchestrator';
 import { parseCsvStatement } from '../../domain/extractions/parsers/csvParser';
 import { parseSpreadsheetStatement } from '../../domain/extractions/parsers/xlsxParser';
-import { decodeTextBuffer } from '../../domain/extractions/parsers/ofxParser';
+import { decodeTextBuffer, parseOfxStatement } from '../../domain/extractions/parsers/ofxParser';
+import { parseJsonStatement, parseXmlStatement } from '../../domain/extractions/parsers/structuredParser';
+import { extractTextFromPdfBufferAsync, parseTextualPdfContent } from '../../domain/extractions/parsers/pdfAndImageParser';
 import { computeStatementBalanceSummary } from '../../domain/extractions/balanceReconciler';
 import { evaluateMovementDuplicates } from '../../domain/extractions/duplicationDetector';
 import { commitApprovedExtractionMovements } from '../../domain/extractions/extractionIntegrationService';
+import {
+  applyDuplicateUserDecision,
+  auditExtractionBatchIntegrity,
+  resolveAuditLifecycleStatus,
+} from '../../domain/extractions/financialIntegrityEngine';
+import {
+  authorizeOpenFinanceConnector,
+  buildMergedConnectorStates,
+  computeConnectorHealthSummary,
+  recordConnectorSyncFromBatch,
+  toggleConnectorEnabled,
+} from '../../domain/extractions/connectors/connectorRegistry';
+import { loadConnectorStates, saveConnectorStates } from '../../services/extractionStorage';
+import { getWorkspaceAccessToken } from '../../services/googleWorkspace';
 import { computeFastHash, validateExtractionUploadFile } from '../../domain/extractions/fileSecurity';
 import { fileStorageService } from '../../services/fileStorage';
 import { cents, fromCents, subtractMoney, toCents } from '../../domain/money/money';
@@ -51,6 +69,8 @@ import { InstitutionCategoryBadge } from './InstitutionCategoryBadge';
 import { InstitutionsAccountsTab } from './InstitutionsAccountsTab';
 import { ConsolidationPanelTab } from './ConsolidationPanelTab';
 import { TraceabilitySheet } from './TraceabilitySheet';
+import { ConnectorsHubPanel } from './ConnectorsHubPanel';
+import { IntegrityAuditPanel } from './IntegrityAuditPanel';
 import {
   AlertCircle,
   AlertTriangle,
@@ -71,9 +91,12 @@ import {
   Layers,
   Link2,
   Mail,
+  Plug,
   Plus,
+  RefreshCw,
   Scale,
   ScanSearch,
+  ShieldAlert,
   ShieldCheck,
   Smartphone,
   Sparkles,
@@ -86,8 +109,10 @@ import { GmailStatementsTab } from '../GmailStatementsTab';
 
 export type ExtractionsSubTab =
   | 'overview'
+  | 'connectors'
   | 'gmail'
   | 'review'
+  | 'audit'
   | 'reconcile'
   | 'institutions'
   | 'consolidation'
@@ -262,6 +287,28 @@ export const ExtractionsHubView: React.FC<ExtractionsHubViewProps> = ({
   const [newRuleKw, setNewRuleKw] = useState('');
   const [newRuleCat, setNewRuleCat] = useState('Alimentação');
 
+  // Phase 2 Connectors state persisted safely in localStorage
+  const [persistedConnectorStates, setPersistedConnectorStates] = useState<FinancialConnectorState[]>(
+    () => loadConnectorStates()
+  );
+
+  const connectorStates = useMemo(
+    () =>
+      buildMergedConnectorStates({
+        persistedStates: persistedConnectorStates,
+        batches,
+        accounts,
+        creditCards,
+        workspaceTokenPresent: Boolean(getWorkspaceAccessToken()),
+      }),
+    [persistedConnectorStates, batches, accounts, creditCards]
+  );
+
+  const connectorHealth = useMemo(
+    () => computeConnectorHealthSummary(connectorStates),
+    [connectorStates]
+  );
+
   const activeAccounts = useMemo(() => accounts.filter((a) => !a.archived), [accounts]);
   const activeBatch = useMemo(
     () => batches.find((b) => b.id === activeBatchId) || batches[0] || null,
@@ -307,7 +354,7 @@ export const ExtractionsHubView: React.FC<ExtractionsHubViewProps> = ({
     };
   }, [activeBatch?.id, activeBatch?.fileId, activeBatch?.format]);
 
-  // Overview aggregate KPIs across all batches
+  // Overview aggregate KPIs across all batches (including Phase 8 integrity/connector stats)
   const overviewStats = useMemo(() => {
     let identified = 0;
     let pending = 0;
@@ -316,11 +363,21 @@ export const ExtractionsHubView: React.FC<ExtractionsHubViewProps> = ({
     let duplicates = 0;
     let unknown = 0;
     let errors = 0;
+    let newMovements = 0;
+    let divergences = 0;
 
     for (const b of batches) {
       if (b.status === 'ERRO') errors += 1;
+      if (b.balanceSummary.hasDivergence) divergences += 1;
+      const unresolvedAuditWarnings = (b.integrityAudit?.findings || []).filter(
+        (f) => f.severity !== 'INFO' && !f.resolvedAction
+      ).length;
+      if (unresolvedAuditWarnings > 0 && !b.balanceSummary.hasDivergence) {
+        divergences += unresolvedAuditWarnings;
+      }
       for (const m of b.movements) {
         identified += 1;
+        if (m.syncState === 'NEW' || m.duplicateStatus === 'INEDITA') newMovements += 1;
         if (m.reviewStatus === 'PENDENTE') pending += 1;
         else if (m.reviewStatus === 'APROVADO') approved += 1;
         else if (m.reviewStatus === 'INTEGRADO') integrated += 1;
@@ -334,6 +391,8 @@ export const ExtractionsHubView: React.FC<ExtractionsHubViewProps> = ({
         }
       }
     }
+
+    const pendingInvoices = creditCards.filter((c) => c.status !== 'PAID').length;
     return {
       totalFiles: batches.length,
       identified,
@@ -343,8 +402,11 @@ export const ExtractionsHubView: React.FC<ExtractionsHubViewProps> = ({
       duplicates,
       unknown,
       errors,
+      newMovements,
+      divergences,
+      pendingInvoices,
     };
-  }, [batches]);
+  }, [batches, creditCards]);
 
   const handleSelectFile = async (file?: File, useRemoteOcr = ocrAuthorized) => {
     if (!file) return;
@@ -395,10 +457,16 @@ export const ExtractionsHubView: React.FC<ExtractionsHubViewProps> = ({
       setActiveBatchId(batch.id);
       setSelectedMovementIds(new Set());
 
+      const nextConnectors = recordConnectorSyncFromBatch(connectorStates, batch);
+      setPersistedConnectorStates(nextConnectors);
+      saveConnectorStates(nextConnectors);
+
       if (batch.movements.length > 0) {
         setBanner({
-          type: 'ok',
-          text: `${batch.movements.length} movimentação(ões) extraída(s) para conferência. Nenhuma foi efetivada ainda — revise e aprove manualmente.`,
+          type: batch.reimportOfBatchId ? 'warn' : 'ok',
+          text: batch.reimportOfBatchId
+            ? `Arquivo já importado anteriormente (${batch.incrementalSummary?.existingCount ?? 0} existente(s) e ${batch.incrementalSummary?.newCount ?? 0} novo(s)). Nenhuma duplicidade foi gravada no sistema.`
+            : `${batch.movements.length} movimentação(ões) extraída(s) para conferência. Nenhuma foi efetivada ainda — revise e aprove manualmente.`,
         });
       } else {
         setBanner({
@@ -562,8 +630,188 @@ export const ExtractionsHubView: React.FC<ExtractionsHubViewProps> = ({
 
   const updateActiveBatch = (updater: (b: ExtractionBatch) => ExtractionBatch) => {
     if (!activeBatch) return;
-    const next = updater(activeBatch);
+    const rawNext = updater(activeBatch);
+    const nextAudit = auditExtractionBatchIntegrity({
+      batch: rawNext,
+      accounts,
+      creditCards,
+      transactions,
+    });
+    const nextLifecycle = resolveAuditLifecycleStatus(rawNext, nextAudit);
+    const next: ExtractionBatch = {
+      ...rawNext,
+      integrityAudit: nextAudit,
+      auditLifecycleStatus: nextLifecycle,
+    };
     onUpdateBatches(batches.map((b) => (b.id === next.id ? next : b)));
+  };
+
+  const handleApplyDuplicateDecision = (params: {
+    movementId?: string;
+    findingId?: string;
+    decision: DuplicateUserDecision;
+    note?: string;
+  }) => {
+    if (!activeBatch) return;
+    const resolved = applyDuplicateUserDecision({
+      batch: activeBatch,
+      ...params,
+    });
+    const nextAudit = auditExtractionBatchIntegrity({
+      batch: resolved,
+      accounts,
+      creditCards,
+      transactions,
+    });
+    const nextLifecycle = resolveAuditLifecycleStatus(resolved, nextAudit);
+    const updated: ExtractionBatch = {
+      ...resolved,
+      integrityAudit: nextAudit,
+      auditLifecycleStatus: nextLifecycle,
+    };
+    onUpdateBatches(batches.map((b) => (b.id === updated.id ? updated : b)));
+    setBanner({
+      type: 'ok',
+      text: `Decisão "${params.decision}" registrada na trilha de auditoria do lote.`,
+    });
+  };
+
+  const handleQuickCreateRuleFromMovement = (m: ExtractedMovement) => {
+    const kw = (m.counterparty || m.originalDescription || '').trim().slice(0, 32);
+    if (kw.length < 2) return;
+    const nowIso = new Date().toISOString();
+    onSaveExtractionRule({
+      id: generateEntityId('erule'),
+      keyword: kw,
+      institutionId:
+        activeBatch?.confirmedInstitutionId || activeBatch?.identifiedAccount.institutionId,
+      accountId: activeBatch?.confirmedAccountId,
+      entityId: m.entityId,
+      movementType: m.movementType,
+      category: m.suggestedCategory,
+      subcategory: m.suggestedSubcategory,
+      counterparty: m.counterparty,
+      createdAt: nowIso,
+    });
+    setBanner({
+      type: 'ok',
+      text: `Regra criada: "${kw}" → ${m.suggestedCategory} para futuras importações.`,
+    });
+  };
+
+  const handleReprocessActiveBatch = async () => {
+    if (!activeBatch) return;
+    setBanner(null);
+
+    if (activeBatch.format === 'PDF' || activeBatch.format === 'IMAGE') {
+      if (activeBatch.fileId || lastFileRef) {
+        // Try local textual PDF reparse first before remote OCR if buffer is available
+        let buf: ArrayBuffer | null = lastRawBuffer;
+        if (!buf && activeBatch.fileId) {
+          const rec = await fileStorageService.getFile(activeBatch.fileId);
+          if (rec) buf = await rec.blob.arrayBuffer();
+        }
+        if (buf && activeBatch.format === 'PDF') {
+          const localExtracted = await extractTextFromPdfBufferAsync(buf);
+          const localParse = parseTextualPdfContent(localExtracted.text, activeBatch.fileName);
+          if (localParse.rows.length > 0) {
+            const rebuilt = buildExtractionBatchFromParseResult({
+              batchId: activeBatch.id,
+              fileName: activeBatch.fileName,
+              fileSizeBytes: activeBatch.fileSizeBytes,
+              fileId: activeBatch.fileId,
+              contentFingerprint: activeBatch.contentFingerprint,
+              parseResult: localParse,
+              accounts,
+              creditCards,
+              transactions,
+              previousBatches: batches.filter((b) => b.id !== activeBatch.id),
+              institutions,
+              accountExtensions,
+              categoryRules,
+              extractionRules,
+              reimportOfBatchId: activeBatch.reimportOfBatchId,
+              existingCorrections: [
+                ...(activeBatch.correctionsHistory || []),
+                {
+                  timestamp: new Date().toISOString(),
+                  actor: 'USUARIO',
+                  field: 'lote',
+                  detail: 'Reprocessamento manual do lote solicitado pelo usuário.',
+                },
+              ],
+            });
+            onUpdateBatches(batches.map((b) => (b.id === rebuilt.id ? rebuilt : b)));
+            setBanner({
+              type: 'ok',
+              text: `Lote reprocessado com ${rebuilt.movements.length} movimentação(ões).`,
+            });
+            return;
+          }
+        }
+        await handleRunOcrOnActiveBatch();
+        return;
+      }
+    }
+
+    let buf: ArrayBuffer | null = lastRawBuffer;
+    if (!buf && activeBatch.fileId) {
+      const rec = await fileStorageService.getFile(activeBatch.fileId);
+      if (rec) buf = await rec.blob.arrayBuffer();
+    }
+    if (!buf) {
+      setBanner({
+        type: 'warn',
+        text: 'Arquivo original indisponível neste dispositivo para reprocessamento automático. Envie o arquivo novamente.',
+      });
+      return;
+    }
+
+    let nextParse: ParseResultPayload | null = null;
+    if (activeBatch.format === 'OFX') {
+      nextParse = parseOfxStatement(decodeTextBuffer(buf), activeBatch.fileName);
+    } else if (activeBatch.format === 'CSV') {
+      nextParse = parseCsvStatement(decodeTextBuffer(buf), activeBatch.fileName);
+    } else if (activeBatch.format === 'XLSX' || activeBatch.format === 'XLS') {
+      nextParse = parseSpreadsheetStatement(buf, activeBatch.fileName);
+    } else if (activeBatch.format === 'JSON') {
+      nextParse = parseJsonStatement(decodeTextBuffer(buf), activeBatch.fileName);
+    } else if (activeBatch.format === 'XML') {
+      nextParse = parseXmlStatement(decodeTextBuffer(buf), activeBatch.fileName);
+    }
+    if (!nextParse) return;
+
+    const rebuilt = buildExtractionBatchFromParseResult({
+      batchId: activeBatch.id,
+      fileName: activeBatch.fileName,
+      fileSizeBytes: activeBatch.fileSizeBytes,
+      fileId: activeBatch.fileId,
+      contentFingerprint: activeBatch.contentFingerprint,
+      parseResult: nextParse,
+      accounts,
+      creditCards,
+      transactions,
+      previousBatches: batches.filter((b) => b.id !== activeBatch.id),
+      institutions,
+      accountExtensions,
+      categoryRules,
+      extractionRules,
+      reimportOfBatchId: activeBatch.reimportOfBatchId,
+      existingCorrections: [
+        ...(activeBatch.correctionsHistory || []),
+        {
+          timestamp: new Date().toISOString(),
+          actor: 'USUARIO',
+          field: 'lote',
+          detail: 'Reprocessamento completo solicitado pelo usuário.',
+        },
+      ],
+    });
+    onUpdateBatches(batches.map((b) => (b.id === rebuilt.id ? rebuilt : b)));
+    setBanner({
+      type: 'ok',
+      text: `Lote reprocessado com sucesso (${rebuilt.movements.length} lançamento(s)).`,
+    });
   };
 
   const handleBindBatchAccount = (accountId: string) => {
@@ -1120,11 +1368,21 @@ export const ExtractionsHubView: React.FC<ExtractionsHubViewProps> = ({
         {(
           [
             { id: 'overview', label: 'Visão geral & Importar', icon: Upload },
+            { id: 'connectors', label: `Conectores (${connectorHealth.configuredCount})`, icon: Plug },
             { id: 'gmail', label: 'Extratos do Gmail', icon: Mail },
             {
               id: 'review',
               label: `Revisão (${overviewStats.pending + overviewStats.unknown + overviewStats.approved})`,
               icon: ClipboardCheck,
+            },
+            {
+              id: 'audit',
+              label: `Auditoria${
+                (activeBatch?.integrityAudit?.findings.filter((f) => f.severity !== 'INFO' && !f.resolvedAction).length || 0) > 0
+                  ? ` (${activeBatch?.integrityAudit?.findings.filter((f) => f.severity !== 'INFO' && !f.resolvedAction).length})`
+                  : ''
+              }`,
+              icon: ShieldAlert,
             },
             { id: 'reconcile', label: 'Conciliação', icon: Scale },
             { id: 'institutions', label: 'Instituições e Contas', icon: Building2 },
@@ -1193,12 +1451,12 @@ export const ExtractionsHubView: React.FC<ExtractionsHubViewProps> = ({
           <section className="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-8 gap-2.5">
             {[
               { label: 'Arquivos', value: overviewStats.totalFiles, tone: 'text-[#0F172A] dark:text-white' },
-              { label: 'Identificadas', value: overviewStats.identified, tone: 'text-[#0F172A] dark:text-blue-300' },
+              { label: 'Novos lanç.', value: overviewStats.newMovements, tone: 'text-[#059669] dark:text-[#10B981]' },
               { label: 'Pendentes', value: overviewStats.pending, tone: 'text-amber-700 dark:text-amber-300' },
               { label: 'Aprovadas', value: overviewStats.approved, tone: 'text-[#059669] dark:text-[#10B981]' },
               { label: 'Integradas', value: overviewStats.integrated, tone: 'text-emerald-700 dark:text-emerald-300' },
               { label: 'Duplicidades', value: overviewStats.duplicates, tone: 'text-amber-700 dark:text-amber-400' },
-              { label: 'Não reconhec.', value: overviewStats.unknown, tone: 'text-purple-700 dark:text-purple-300' },
+              { label: 'Divergências', value: overviewStats.divergences, tone: overviewStats.divergences > 0 ? 'text-amber-700 dark:text-amber-300' : 'text-slate-600 dark:text-slate-300' },
               { label: 'Erros', value: overviewStats.errors, tone: 'text-[#DC3545]' },
             ].map((k) => (
               <div
@@ -1213,6 +1471,57 @@ export const ExtractionsHubView: React.FC<ExtractionsHubViewProps> = ({
                 </strong>
               </div>
             ))}
+          </section>
+
+          {/* Phase 8 Operational Sync & Integrity Summary Bar */}
+          <section className="sf-card p-3.5 grid grid-cols-2 sm:grid-cols-4 gap-3 text-xs">
+            <div>
+              <span className="block text-[10px] font-semibold text-slate-400 uppercase">
+                Última atualização
+              </span>
+              <strong className="text-[#0F172A] dark:text-white">
+                {connectorHealth.lastSyncAt
+                  ? new Date(connectorHealth.lastSyncAt).toLocaleString('pt-BR')
+                  : 'Nenhuma sincronização'}
+              </strong>
+            </div>
+            <div>
+              <span className="block text-[10px] font-semibold text-slate-400 uppercase">
+                Fontes conectadas
+              </span>
+              <strong className="text-[#0F172A] dark:text-white">
+                {connectorHealth.configuredCount} de {connectorHealth.totalConnectors}
+              </strong>
+              <button
+                type="button"
+                onClick={() => setSubTab('connectors')}
+                className="ml-2 text-[11px] font-bold text-[#059669] underline cursor-pointer"
+              >
+                Gerenciar
+              </button>
+            </div>
+            <div>
+              <span className="block text-[10px] font-semibold text-slate-400 uppercase">
+                Faturas pendentes de revisão
+              </span>
+              <strong className="text-[#0F172A] dark:text-white">
+                {overviewStats.pendingInvoices} cartão(ões)
+              </strong>
+            </div>
+            <div>
+              <span className="block text-[10px] font-semibold text-slate-400 uppercase">
+                Auditoria do lote ativo
+              </span>
+              <button
+                type="button"
+                onClick={() => setSubTab('audit')}
+                className="font-bold text-[#061E3E] dark:text-blue-300 underline cursor-pointer"
+              >
+                {activeBatch
+                  ? `${activeBatch.integrityAudit?.findings.filter((f) => f.severity !== 'INFO' && !f.resolvedAction).length || 0} alerta(s) aberto(s)`
+                  : 'Ver auditoria'}
+              </button>
+            </div>
           </section>
 
           {/* Upload Zone + 7-Stage Pipeline */}
@@ -1662,7 +1971,35 @@ export const ExtractionsHubView: React.FC<ExtractionsHubViewProps> = ({
                       <span className="px-2 py-0.5 rounded bg-slate-100 dark:bg-white/10 text-[10px] font-bold">
                         {activeBatch.format} · {activeBatch.parseSource}
                       </span>
+                      {activeBatch.reimportOfBatchId && (
+                        <span className="px-2 py-0.5 rounded bg-amber-100 text-amber-800 dark:bg-amber-950/70 dark:text-amber-300 text-[10px] font-bold">
+                          Reimportação segura ({activeBatch.reimportOfBatchId})
+                        </span>
+                      )}
+                      <button
+                        type="button"
+                        onClick={() => void handleReprocessActiveBatch()}
+                        className="px-2.5 py-0.5 rounded bg-slate-100 hover:bg-slate-200 dark:bg-white/10 text-[10px] font-bold inline-flex items-center gap-1 cursor-pointer"
+                      >
+                        <RefreshCw size={10} /> Reprocessar lote
+                      </button>
                     </div>
+                    {activeBatch.incrementalSummary && (
+                      <div className="flex flex-wrap gap-1.5 text-[10px] font-bold">
+                        <span className="px-2 py-0.5 rounded bg-emerald-50 text-emerald-700 dark:bg-emerald-950/60 dark:text-emerald-300">
+                          Novos: {activeBatch.incrementalSummary.newCount}
+                        </span>
+                        <span className="px-2 py-0.5 rounded bg-slate-100 text-slate-700 dark:bg-white/10 dark:text-slate-300">
+                          Existentes: {activeBatch.incrementalSummary.existingCount}
+                        </span>
+                        <span className="px-2 py-0.5 rounded bg-sky-50 text-sky-700 dark:bg-sky-950/60 dark:text-sky-300">
+                          Atualiz. origem: {activeBatch.incrementalSummary.updatedSourceCount}
+                        </span>
+                        <span className="px-2 py-0.5 rounded bg-amber-50 text-amber-700 dark:bg-amber-950/60 dark:text-amber-300">
+                          Poss. duplicidades: {activeBatch.incrementalSummary.possibleDuplicateCount}
+                        </span>
+                      </div>
+                    )}
                     <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-[#64748B] dark:text-slate-300">
                       {activeBatch.identifiedAccount.bankName && (
                         <span>
@@ -2263,6 +2600,32 @@ export const ExtractionsHubView: React.FC<ExtractionsHubViewProps> = ({
                               {m.duplicateStatus !== 'INEDITA' && (
                                 <span className="px-2 py-0.5 rounded bg-amber-100 dark:bg-amber-950 text-amber-800 dark:text-amber-300 text-[10px] font-bold">
                                   {m.duplicateStatus.replace(/_/g, ' ')}
+                                  {m.duplicateLayer && m.duplicateLayer !== 'NONE'
+                                    ? ` · ${m.duplicateLayer}`
+                                    : ''}
+                                </span>
+                              )}
+                              {m.syncState && m.syncState !== 'NEW' && (
+                                <span className="px-2 py-0.5 rounded bg-purple-50 dark:bg-purple-950/60 text-purple-700 dark:text-purple-300 text-[10px] font-bold">
+                                  {m.syncState === 'UPDATED_SOURCE'
+                                    ? 'Atualizado na origem'
+                                    : m.syncState === 'EXISTING'
+                                      ? 'Existente'
+                                      : m.syncState === 'NEEDS_REVIEW'
+                                        ? 'Revisão'
+                                        : m.syncState === 'INVALID'
+                                          ? 'Inválido'
+                                          : 'Possível duplic.'}
+                                </span>
+                              )}
+                              {m.duplicateRelatedKind && (
+                                <span className="px-2 py-0.5 rounded bg-indigo-50 dark:bg-indigo-950/60 text-indigo-700 dark:text-indigo-300 text-[10px] font-bold">
+                                  {m.duplicateRelatedKind.replace(/_/g, ' ')}
+                                </span>
+                              )}
+                              {m.duplicateResolution && (
+                                <span className="px-2 py-0.5 rounded bg-emerald-50 dark:bg-emerald-950/60 text-emerald-700 dark:text-emerald-300 text-[10px] font-bold">
+                                  Decisão: {m.duplicateResolution.decision}
                                 </span>
                               )}
                             </div>
@@ -2293,6 +2656,48 @@ export const ExtractionsHubView: React.FC<ExtractionsHubViewProps> = ({
                               )}
                             </div>
 
+                            {/* Phase 6 Separated Confidence Breakdown & AI Rationale */}
+                            {m.confidenceBreakdown && (
+                              <div className="flex flex-wrap gap-1.5 text-[10px] text-slate-500 dark:text-slate-400">
+                                {m.confidenceBreakdown.ocr !== undefined && (
+                                  <span className="px-1.5 py-0.5 rounded bg-slate-100 dark:bg-white/5">
+                                    OCR {Math.round(m.confidenceBreakdown.ocr * 100)}%
+                                  </span>
+                                )}
+                                <span className="px-1.5 py-0.5 rounded bg-slate-100 dark:bg-white/5">
+                                  Extração {Math.round(m.confidenceBreakdown.extraction * 100)}%
+                                </span>
+                                <span className="px-1.5 py-0.5 rounded bg-slate-100 dark:bg-white/5">
+                                  Banco {Math.round(m.confidenceBreakdown.bankDetection * 100)}%
+                                </span>
+                                <span className="px-1.5 py-0.5 rounded bg-slate-100 dark:bg-white/5">
+                                  Conta {Math.round(m.confidenceBreakdown.accountMatch * 100)}%
+                                </span>
+                                <span className="px-1.5 py-0.5 rounded bg-slate-100 dark:bg-white/5">
+                                  Classif. {Math.round(m.confidenceBreakdown.classification * 100)}%
+                                </span>
+                                <span className="px-1.5 py-0.5 rounded bg-slate-100 dark:bg-white/5">
+                                  Duplic. {Math.round(m.confidenceBreakdown.duplication * 100)}%
+                                </span>
+                              </div>
+                            )}
+
+                            {m.classificationRationale && (
+                              <div className="text-[11px] text-slate-600 dark:text-slate-300 bg-slate-50/80 dark:bg-white/5 rounded-lg px-2.5 py-1.5 border border-slate-200/60 dark:border-white/10">
+                                <strong>Sugestão ({m.classificationRationale.ruleOrigin}):</strong>{' '}
+                                {m.classificationRationale.reason} ·{' '}
+                                <span className="text-slate-500 dark:text-slate-400">
+                                  Evidência: {m.classificationRationale.evidence}
+                                </span>
+                              </div>
+                            )}
+
+                            {m.updatedSourceDiff && m.updatedSourceDiff.length > 0 && (
+                              <div className="text-[11px] text-sky-700 dark:text-sky-300 font-semibold">
+                                Alteração na origem: {m.updatedSourceDiff.join(' | ')}
+                              </div>
+                            )}
+
                             {m.duplicateMatchReason && (
                               <div className="text-[11px] text-amber-700 dark:text-amber-300">
                                 {m.duplicateMatchReason}
@@ -2303,6 +2708,63 @@ export const ExtractionsHubView: React.FC<ExtractionsHubViewProps> = ({
                                 Erro de integração: {m.integrationError}
                               </div>
                             )}
+
+                            {/* Explicit Duplicate / Suspect Resolution Actions */}
+                            {!isIntegrated &&
+                              (m.duplicateStatus === 'POSSIVEL_DUPLICIDADE' ||
+                                m.syncState === 'UPDATED_SOURCE') &&
+                              !m.duplicateResolution && (
+                                <div className="flex flex-wrap gap-1.5 pt-1">
+                                  <button
+                                    type="button"
+                                    onClick={() =>
+                                      handleApplyDuplicateDecision({
+                                        movementId: m.id,
+                                        decision: 'CONFIRM_DUPLICATE',
+                                      })
+                                    }
+                                    className="px-2 py-1 rounded bg-red-100 text-red-800 dark:bg-red-950 dark:text-red-300 text-[10px] font-bold cursor-pointer"
+                                  >
+                                    Confirmar duplicidade
+                                  </button>
+                                  <button
+                                    type="button"
+                                    onClick={() =>
+                                      handleApplyDuplicateDecision({
+                                        movementId: m.id,
+                                        decision: 'KEEP_BOTH',
+                                      })
+                                    }
+                                    className="px-2 py-1 rounded bg-emerald-100 text-emerald-800 dark:bg-emerald-950 dark:text-emerald-300 text-[10px] font-bold cursor-pointer"
+                                  >
+                                    Manter ambos
+                                  </button>
+                                  <button
+                                    type="button"
+                                    onClick={() =>
+                                      handleApplyDuplicateDecision({
+                                        movementId: m.id,
+                                        decision: 'LINK_MOVEMENTS',
+                                      })
+                                    }
+                                    className="px-2 py-1 rounded bg-sky-100 text-sky-800 dark:bg-sky-950 dark:text-sky-300 text-[10px] font-bold cursor-pointer"
+                                  >
+                                    Vincular
+                                  </button>
+                                  <button
+                                    type="button"
+                                    onClick={() =>
+                                      handleApplyDuplicateDecision({
+                                        movementId: m.id,
+                                        decision: 'IGNORE_ALERT',
+                                      })
+                                    }
+                                    className="px-2 py-1 rounded bg-slate-100 text-slate-600 dark:bg-white/10 dark:text-slate-300 text-[10px] font-semibold cursor-pointer"
+                                  >
+                                    Ignorar alerta
+                                  </button>
+                                </div>
+                              )}
                           </div>
                         </div>
 
@@ -2320,7 +2782,7 @@ export const ExtractionsHubView: React.FC<ExtractionsHubViewProps> = ({
                               : `${m.currency} ${hideValues ? '•••••' : formatCurrencyBRL(m.amount)}`}
                           </span>
 
-                          <div className="flex items-center gap-1">
+                          <div className="flex flex-wrap items-center gap-1">
                             {!isIntegrated && (
                               <>
                                 <button
@@ -2337,15 +2799,23 @@ export const ExtractionsHubView: React.FC<ExtractionsHubViewProps> = ({
                                   type="button"
                                   onClick={() => handleUpdateMovementStatus(m.id, 'APROVADO')}
                                   className="px-2.5 py-1.5 rounded-lg bg-[#059669] text-white text-[11px] font-bold inline-flex items-center gap-1 cursor-pointer"
-                                  title="Aprovar manualmente"
+                                  title="Aceitar sugestão e aprovar"
                                 >
-                                  <Check size={12} /> Aprovar
+                                  <Check size={12} /> Aceitar
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => handleQuickCreateRuleFromMovement(m)}
+                                  className="px-2 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 text-[11px] font-semibold text-slate-600 dark:text-slate-300 cursor-pointer"
+                                  title="Criar regra recorrente com esta categoria"
+                                >
+                                  + Regra
                                 </button>
                                 <button
                                   type="button"
                                   onClick={() => handleUpdateMovementStatus(m.id, 'IGNORADO')}
                                   className="px-2 py-1.5 rounded-lg text-slate-400 hover:text-red-600 text-[11px] font-semibold cursor-pointer"
-                                  title="Ignorar movimentação"
+                                  title="Rejeitar / Ignorar movimentação"
                                 >
                                   <XCircle size={14} />
                                 </button>
@@ -2690,6 +3160,52 @@ export const ExtractionsHubView: React.FC<ExtractionsHubViewProps> = ({
         />
       )}
 
+      {/* ==================== TAB CONECTORES ==================== */}
+      {subTab === 'connectors' && (
+        <ConnectorsHubPanel
+          connectorStates={connectorStates}
+          healthSummary={connectorHealth}
+          batches={batches}
+          accounts={accounts}
+          creditCards={creditCards}
+          onToggleConnector={(id) => {
+            const next = toggleConnectorEnabled(connectorStates, id);
+            setPersistedConnectorStates(next);
+            saveConnectorStates(next);
+          }}
+          onToggleOpenFinanceAuth={(authorized) => {
+            const next = authorizeOpenFinanceConnector(connectorStates, authorized);
+            setPersistedConnectorStates(next);
+            saveConnectorStates(next);
+          }}
+          onGoToImport={() => {
+            setSubTab('overview');
+            inputRef.current?.click();
+          }}
+          onGoToGmail={() => setSubTab('gmail')}
+          onNavigateCards={onNavigateModule ? () => onNavigateModule('cards') : undefined}
+        />
+      )}
+
+      {/* ==================== TAB AUDITORIA & INTEGRIDADE ==================== */}
+      {subTab === 'audit' && (
+        <IntegrityAuditPanel
+          batch={activeBatch}
+          onApplyDecision={handleApplyDuplicateDecision}
+          onOpenMovementEdit={(movId) => {
+            const target = activeBatch?.movements.find((m) => m.id === movId);
+            if (target) {
+              setEditingMovement(target);
+              setSaveRuleKeyword(target.originalDescription.slice(0, 24));
+              setSubTab('review');
+            }
+          }}
+          onReprocessBatch={() => void handleReprocessActiveBatch()}
+          onGoToReview={() => setSubTab('review')}
+          onGoToImport={() => setSubTab('overview')}
+        />
+      )}
+
       {/* ==================== TAB GMAIL: EXTRATOS VIA GMAIL ==================== */}
       {subTab === 'gmail' && (
         <GmailStatementsTab
@@ -2758,12 +3274,29 @@ export const ExtractionsHubView: React.FC<ExtractionsHubViewProps> = ({
                             {b.status}
                           </span>
                         </div>
-                        <div className="text-[11px] text-slate-500 flex flex-wrap gap-x-3">
+                        <div className="text-[11px] text-slate-500 flex flex-wrap gap-x-3 gap-y-0.5">
+                          <span>Lote: <code className="font-mono">{b.id}</code></span>
                           <span>Importado: {new Date(b.importedAt).toLocaleString('pt-BR')}</span>
+                          {b.parserVersion && <span>Parser: <code className="font-mono">{b.parserVersion}</code></span>}
+                          {b.extractionMethod && <span>Método: {b.extractionMethod}</span>}
+                          {b.auditLifecycleStatus && <span>Ciclo: {b.auditLifecycleStatus}</span>}
                           <span>Total: {b.movements.length}</span>
+                          {b.incrementalSummary && (
+                            <>
+                              <span>Novos: {b.incrementalSummary.newCount}</span>
+                              <span>Existentes: {b.incrementalSummary.existingCount}</span>
+                            </>
+                          )}
                           <span>Aprov./Integ.: {approvedCnt}</span>
                           <span>Ignoradas: {ignoredCnt}</span>
                           <span>Duplicadas: {dupCnt}</span>
+                          <span>
+                            Conciliação:{' '}
+                            {b.balanceSummary.hasDivergence ? 'Divergente' : 'Consistente'}
+                          </span>
+                          {(b.correctionsHistory?.length || 0) > 0 && (
+                            <span>Correções manuais: {b.correctionsHistory?.length}</span>
+                          )}
                         </div>
                       </div>
 

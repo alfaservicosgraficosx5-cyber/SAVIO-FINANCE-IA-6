@@ -5,6 +5,7 @@ import type {
   Asset,
   AuditLogEntry,
   Boleto,
+  CategoryRule,
   CreditCard,
   Debt,
   Transaction,
@@ -21,6 +22,7 @@ export interface AtomicMutationBatch {
   accounts?: Account[];
   assets?: Asset[];
   salaryData?: SalaryDataset;
+  categoryRules?: CategoryRule[];
   auditLogs?: AuditLogEntry[];
   reversals?: TransactionReversalRecord[];
 }
@@ -87,6 +89,11 @@ export async function commitAtomicMutationBatch(
       captureKey(STORAGE_KEYS.reversals);
       const res = saveJsonSafe(STORAGE_KEYS.reversals, batch.reversals);
       if (!res.ok) throw new Error(res.error || 'Falha ao salvar registro de estorno.');
+    }
+    if (batch.categoryRules) {
+      captureKey(STORAGE_KEYS.categoryRules);
+      const res = saveJsonSafe(STORAGE_KEYS.categoryRules, batch.categoryRules);
+      if (!res.ok) throw new Error(res.error || 'Falha ao salvar regras de classificação.');
     }
   } catch (err) {
     // Rollback any already-written localStorage keys

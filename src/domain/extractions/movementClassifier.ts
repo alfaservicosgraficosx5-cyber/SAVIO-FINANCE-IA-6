@@ -1,6 +1,8 @@
 import type { CategoryRule, Direction, IncomeOriginKey, OperationType } from '../../types';
 import type {
   CardPurchaseMeta,
+  ClassificationRationale,
+  ClassificationRuleOrigin,
   CryptoOperationMeta,
   ExtractionMovementType,
   ExtractionRule,
@@ -46,12 +48,31 @@ export interface ClassificationOutput {
   matchedRuleId?: string;
   matchedRuleKeyword?: string;
   confidence: number;
+  rationale: ClassificationRationale;
   doubtReason?: string;
   needsIdentification: boolean;
   investmentMeta?: InvestmentBreakdownMeta;
   cryptoMeta?: CryptoOperationMeta;
   fxMeta?: ForeignExchangeMeta;
   cardMeta?: CardPurchaseMeta;
+}
+
+function buildRationale(
+  suggestedCategory: string,
+  reason: string,
+  evidence: string,
+  ruleOrigin: ClassificationRuleOrigin,
+  score: number,
+  ruleHistoryCount?: number
+): ClassificationRationale {
+  return {
+    suggestedCategory,
+    reason,
+    evidence,
+    ruleOrigin,
+    score,
+    ...(ruleHistoryCount !== undefined ? { ruleHistoryCount } : {}),
+  };
 }
 
 function extractCounterpartyFromDescription(desc: string): string | undefined {
@@ -158,6 +179,9 @@ export function classifyExtractedMovement(input: ClassificationInput): Classific
       return kw.length >= 2 && norm.includes(kw);
     });
     if (matchedExt) {
+      const ruleHistoryCount = input.extractionRules.filter(
+        (r) => normalizeDescription(r.keyword) === normalizeDescription(matchedExt.keyword)
+      ).length;
       return {
         movementType:
           matchedExt.movementType ||
@@ -172,6 +196,14 @@ export function classifyExtractedMovement(input: ClassificationInput): Classific
         matchedRuleId: matchedExt.id,
         matchedRuleKeyword: matchedExt.keyword,
         confidence: 0.94,
+        rationale: buildRationale(
+          matchedExt.category,
+          `Regra aprendida de extração aplicada para "${matchedExt.keyword}".`,
+          `Palavra-chave "${matchedExt.keyword}" reconhecida na descrição.`,
+          'EXTRACTION_RULE',
+          0.94,
+          ruleHistoryCount
+        ),
         needsIdentification: false,
         investmentMeta: input.rawInvestmentMeta,
         cryptoMeta: input.rawCryptoMeta,
@@ -200,15 +232,24 @@ export function classifyExtractedMovement(input: ClassificationInput): Classific
     (input.existingConfidence !== undefined && input.existingConfidence < 0.6) ||
     /ileg[ií]vel|desconhecid|sem descri[cç][aã]o|nao identificad/.test(combined)
   ) {
+    const score = input.existingConfidence ?? 0.35;
+    const reason =
+      input.existingDoubtReason ||
+      'Descrição genérica, incompleta ou baixa confiança de leitura; identifique manualmente.';
     return {
       movementType: 'NAO_IDENTIFICADO',
       operationType: 'OUTRO',
       suggestedCategory: 'Outros',
       counterparty,
-      confidence: input.existingConfidence ?? 0.35,
-      doubtReason:
-        input.existingDoubtReason ||
-        'Descrição genérica, incompleta ou baixa confiança de leitura; identifique manualmente.',
+      confidence: score,
+      rationale: buildRationale(
+        'Outros',
+        reason,
+        input.description.slice(0, 80) || 'Sem descrição legível',
+        'FALLBACK',
+        score
+      ),
+      doubtReason: reason,
       needsIdentification: true,
       investmentMeta: input.rawInvestmentMeta,
       cryptoMeta: input.rawCryptoMeta,
@@ -226,6 +267,13 @@ export function classifyExtractedMovement(input: ClassificationInput): Classific
       suggestedSubcategory: 'Estorno / Reembolso',
       counterparty,
       confidence: 0.9,
+      rationale: buildRationale(
+        'Outros',
+        'Termo de estorno, devolução ou reembolso identificado.',
+        input.description.slice(0, 80),
+        'HEURISTIC',
+        0.9
+      ),
       needsIdentification: false,
       cardMeta: baseCardMeta,
       fxMeta,
@@ -241,6 +289,13 @@ export function classifyExtractedMovement(input: ClassificationInput): Classific
       suggestedSubcategory: 'Cashback',
       counterparty,
       confidence: 0.92,
+      rationale: buildRationale(
+        'Outros',
+        'Benefício ou crédito de cashback separado de receita operacional.',
+        input.description.slice(0, 80),
+        'HEURISTIC',
+        0.92
+      ),
       needsIdentification: false,
       cardMeta: baseCardMeta,
       fxMeta,
@@ -256,6 +311,13 @@ export function classifyExtractedMovement(input: ClassificationInput): Classific
       suggestedSubcategory: 'Aporte PF/PJ',
       counterparty,
       confidence: 0.9,
+      rationale: buildRationale(
+        'Transferência',
+        'Aporte ou movimentação societária PF/PJ tratada como transferência patrimonial.',
+        input.description.slice(0, 80),
+        'HEURISTIC',
+        0.9
+      ),
       needsIdentification: false,
       fxMeta,
     };
@@ -264,15 +326,23 @@ export function classifyExtractedMovement(input: ClassificationInput): Classific
   if (/\bpro[\s-]*labore\b|\bretirada\s*(?:de\s*)?socio|\bdistribuicao\s*(?:de\s*)?lucros?\b/.test(combined)) {
     const isProfitDist = /\blucro/.test(combined);
     const sub = isProfitDist ? 'Distribuição de Lucros' : 'Pró-labore / Retirada de Sócio';
+    const cat = input.direction === 'INCOME' ? 'Salário' : 'Pró-labore';
     return {
       movementType: input.direction === 'INCOME' ? 'RECEITA' : 'DESPESA',
       operationType: /\bpix\b/.test(combined) ? 'PIX' : 'TED_DOC',
-      suggestedCategory: input.direction === 'INCOME' ? 'Salário' : 'Pró-labore',
+      suggestedCategory: cat,
       suggestedSubcategory: sub,
       incomeOrigin: input.direction === 'INCOME' ? 'salary' : undefined,
       incomeSourceName: input.direction === 'INCOME' ? sub : undefined,
       counterparty,
       confidence: 0.91,
+      rationale: buildRationale(
+        cat,
+        `Identificado ${sub} pela descrição do lançamento.`,
+        input.description.slice(0, 80),
+        'HEURISTIC',
+        0.91
+      ),
       needsIdentification: false,
       fxMeta,
     };
@@ -290,6 +360,13 @@ export function classifyExtractedMovement(input: ClassificationInput): Classific
       suggestedCategory: 'Investimento',
       counterparty,
       confidence: 0.9,
+      rationale: buildRationale(
+        'Investimento',
+        'Operação ou instituição ligada a criptoativos.',
+        input.rawCryptoMeta?.assetSymbol || input.description.slice(0, 80),
+        'HEURISTIC',
+        0.9
+      ),
       needsIdentification: false,
       cryptoMeta: input.rawCryptoMeta,
       fxMeta,
@@ -306,6 +383,13 @@ export function classifyExtractedMovement(input: ClassificationInput): Classific
       suggestedCategory: 'Cartão',
       counterparty,
       confidence: 0.92,
+      rationale: buildRationale(
+        'Cartão',
+        'Pagamento/baixa de fatura de cartão para evitar dupla contagem de consumo.',
+        input.description.slice(0, 80),
+        'HEURISTIC',
+        0.92
+      ),
       needsIdentification: false,
       cardMeta: { ...(baseCardMeta || {}), isInvoicePayment: true },
       fxMeta,
@@ -320,6 +404,13 @@ export function classifyExtractedMovement(input: ClassificationInput): Classific
       suggestedCategory: 'Investimento',
       counterparty,
       confidence: 0.92,
+      rationale: buildRationale(
+        'Investimento',
+        'Provento, dividendo ou JCP identificado na descrição.',
+        input.description.slice(0, 80),
+        'HEURISTIC',
+        0.92
+      ),
       needsIdentification: false,
       investmentMeta: extractCdiMetadata(input.description, input.rawInvestmentMeta),
       fxMeta,
@@ -330,7 +421,6 @@ export function classifyExtractedMovement(input: ClassificationInput): Classific
   if (/\bresgate\b|\bretirada\s*aplic|\bliquidacao\s*cdb|\bvencimento\s*cdb/.test(combined)) {
     const invMeta = extractCdiMetadata(input.description, input.rawInvestmentMeta);
     if (!invMeta.principalCents && !invMeta.yieldCents) {
-      // Preserve net value; user can inspect/split principal vs yield if statement omitted breakdown
       invMeta.netCents = cents(input.amountCents);
     }
     return {
@@ -339,6 +429,13 @@ export function classifyExtractedMovement(input: ClassificationInput): Classific
       suggestedCategory: 'Investimento',
       counterparty,
       confidence: 0.9,
+      rationale: buildRationale(
+        'Investimento',
+        'Resgate financeiro separado entre principal patrimonial e eventual rendimento.',
+        invMeta.productName || input.description.slice(0, 80),
+        'HEURISTIC',
+        0.9
+      ),
       needsIdentification: false,
       investmentMeta: invMeta,
       fxMeta,
@@ -346,7 +443,6 @@ export function classifyExtractedMovement(input: ClassificationInput): Classific
   }
 
   // 8. Investments: Yields / Rendimentos (CDB, RDB, CDI, Conta Remunerada, Poupança)
-  // Note: CDI alone without yield/product context -> flag or treat strictly as benchmark metadata
   if (/rendimento|juros\s*poupanca|remuneracao\s*(?:cdb|rdb|cdi|conta)|credito\s*rend/.test(combined)) {
     const invMeta = extractCdiMetadata(input.description, input.rawInvestmentMeta);
     return {
@@ -355,6 +451,13 @@ export function classifyExtractedMovement(input: ClassificationInput): Classific
       suggestedCategory: 'Investimento',
       counterparty,
       confidence: 0.91,
+      rationale: buildRationale(
+        'Investimento',
+        'Rendimento financeiro identificado com metadados de indexador.',
+        invMeta.indexerRateLabel || invMeta.productName || input.description.slice(0, 80),
+        'HEURISTIC',
+        0.91
+      ),
       needsIdentification: false,
       investmentMeta: invMeta,
       fxMeta,
@@ -380,6 +483,13 @@ export function classifyExtractedMovement(input: ClassificationInput): Classific
       suggestedCategory: 'Investimento',
       counterparty,
       confidence: 0.9,
+      rationale: buildRationale(
+        'Investimento',
+        'Aplicação financeira ou aquisição de ativo patrimonial (não classificada como despesa de consumo).',
+        invMeta.ticker || invMeta.productName || input.description.slice(0, 80),
+        'HEURISTIC',
+        0.9
+      ),
       needsIdentification: false,
       investmentMeta: invMeta,
       fxMeta,
@@ -398,6 +508,13 @@ export function classifyExtractedMovement(input: ClassificationInput): Classific
       suggestedCategory: 'Investimento',
       counterparty,
       confidence: 0.88,
+      rationale: buildRationale(
+        'Investimento',
+        'Alienação/venda de ativo em corretora.',
+        input.description.slice(0, 80),
+        'HEURISTIC',
+        0.88
+      ),
       needsIdentification: false,
       investmentMeta: extractCdiMetadata(input.description, input.rawInvestmentMeta),
       fxMeta,
@@ -412,6 +529,13 @@ export function classifyExtractedMovement(input: ClassificationInput): Classific
       suggestedCategory: 'Impostos',
       counterparty,
       confidence: 0.89,
+      rationale: buildRationale(
+        'Impostos',
+        'Guia tributária, IOF ou retenção fiscal reconhecida na descrição.',
+        input.description.slice(0, 80),
+        'HEURISTIC',
+        0.89
+      ),
       needsIdentification: false,
       fxMeta,
     };
@@ -425,6 +549,13 @@ export function classifyExtractedMovement(input: ClassificationInput): Classific
       suggestedCategory: 'Serviços',
       counterparty,
       confidence: 0.9,
+      rationale: buildRationale(
+        'Serviços',
+        'Tarifa, anuidade ou encargo bancário reconhecido.',
+        input.description.slice(0, 80),
+        'HEURISTIC',
+        0.9
+      ),
       needsIdentification: false,
       fxMeta,
     };
@@ -439,6 +570,12 @@ export function classifyExtractedMovement(input: ClassificationInput): Classific
       fallbackCategory: 'Outros',
     });
     const isOwnPix = /mesma\s*titularidade|entre\s*contas\s*proprias/.test(combined);
+    const cat = isOwnPix ? 'Transferência' : catRes.category;
+    const customHistCount = catRes.isCustomRule && catRes.matchedRuleKeyword
+      ? (input.customRules || []).filter(
+          (r) => normalizeDescription(r.keyword) === normalizeDescription(catRes.matchedRuleKeyword!)
+        ).length
+      : undefined;
     return {
       movementType: isOwnPix
         ? 'TRANSFERENCIA'
@@ -446,7 +583,7 @@ export function classifyExtractedMovement(input: ClassificationInput): Classific
           ? 'PIX_RECEBIDO'
           : 'PIX_ENVIADO',
       operationType: isOwnPix ? 'TRANSFERENCIA_PROPRIA' : 'PIX',
-      suggestedCategory: isOwnPix ? 'Transferência' : catRes.category,
+      suggestedCategory: cat,
       suggestedSubcategory: isOwnPix
         ? 'Transferência entre contas'
         : input.direction === 'INCOME'
@@ -455,6 +592,18 @@ export function classifyExtractedMovement(input: ClassificationInput): Classific
       counterparty,
       matchedRuleKeyword: catRes.matchedRuleKeyword,
       confidence: 0.91,
+      rationale: buildRationale(
+        cat,
+        isOwnPix
+          ? 'PIX identificado como transferência de mesma titularidade.'
+          : catRes.isCustomRule
+            ? `Regra personalizada "${catRes.matchedRuleKeyword}" aplicada sobre operação PIX.`
+            : 'Operação PIX identificada por descrição ou identificador E2E.',
+        catRes.matchedRuleKeyword || input.bankTransactionId || input.description.slice(0, 80),
+        catRes.isCustomRule ? 'CUSTOM_RULE' : 'HEURISTIC',
+        0.91,
+        customHistCount
+      ),
       needsIdentification: false,
       fxMeta,
     };
@@ -469,6 +618,13 @@ export function classifyExtractedMovement(input: ClassificationInput): Classific
       suggestedSubcategory: 'Transferência entre contas',
       counterparty,
       confidence: 0.9,
+      rationale: buildRationale(
+        'Transferência',
+        'Expressão explícita de transferência entre contas próprias.',
+        input.description.slice(0, 80),
+        'HEURISTIC',
+        0.9
+      ),
       needsIdentification: false,
       fxMeta,
     };
@@ -496,18 +652,26 @@ export function classifyExtractedMovement(input: ClassificationInput): Classific
     isFallbackMatch &&
     (/^(lancamento|movimento|debito|credito|doc|ted|transferencia|pagamento|compra)\s*\d*$/i.test(norm) ||
       norm.length < 4 ||
-      /\bcdi\b/.test(norm)); // Standalone CDI mention without clear yield/product
+      /\bcdi\b/.test(norm));
 
   if (isVagueDescription) {
+    const reason = /\bcdi\b/.test(norm)
+      ? 'Menção isolada a CDI — confirme se trata de rendimento, aplicação ou apenas informação de indexador.'
+      : 'Descrição genérica sem contexto suficiente para classificação segura.';
     return {
       movementType: 'NAO_IDENTIFICADO',
       operationType: opType,
       suggestedCategory: catRes.category,
       counterparty,
       confidence: 0.48,
-      doubtReason: /\bcdi\b/.test(norm)
-        ? 'Menção isolada a CDI — confirme se trata de rendimento, aplicação ou apenas informação de indexador.'
-        : 'Descrição genérica sem contexto suficiente para classificação segura.',
+      rationale: buildRationale(
+        catRes.category,
+        reason,
+        input.description.slice(0, 80),
+        'FALLBACK',
+        0.48
+      ),
+      doubtReason: reason,
       needsIdentification: true,
       cardMeta: baseCardMeta,
       fxMeta,
@@ -532,6 +696,27 @@ export function classifyExtractedMovement(input: ClassificationInput): Classific
         ? 0.85
         : 0.68;
 
+  const customRuleHistory =
+    catRes.isCustomRule && catRes.matchedRuleKeyword
+      ? (input.customRules || []).filter(
+          (r) => normalizeDescription(r.keyword) === normalizeDescription(catRes.matchedRuleKeyword!)
+        ).length
+      : undefined;
+
+  const ruleOrigin: ClassificationRuleOrigin = catRes.isCustomRule
+    ? 'CUSTOM_RULE'
+    : catRes.matchedRuleKeyword
+      ? 'HEURISTIC'
+      : 'FALLBACK';
+
+  const reasonText = catRes.isCustomRule
+    ? `Regra personalizada "${catRes.matchedRuleKeyword}" associada ao lançamento.`
+    : catRes.matchedRuleKeyword
+      ? `Palavra-chave padrão "${catRes.matchedRuleKeyword}" reconhecida na descrição.`
+      : incomeMatch && incomeMatch.originKey !== 'other'
+        ? `Origem de receita identificada como "${incomeMatch.sourceName}".`
+        : 'Sugestão padrão baseada na direção do lançamento — recomenda-se revisão.';
+
   return {
     movementType:
       opType === 'TED_DOC' && /transferencia|transf\b/.test(combined)
@@ -550,6 +735,14 @@ export function classifyExtractedMovement(input: ClassificationInput): Classific
     counterparty,
     matchedRuleKeyword: catRes.matchedRuleKeyword,
     confidence: computedConfidence,
+    rationale: buildRationale(
+      catRes.category,
+      reasonText,
+      catRes.matchedRuleKeyword || incomeMatch?.sourceName || input.description.slice(0, 80),
+      ruleOrigin,
+      computedConfidence,
+      customRuleHistory
+    ),
     needsIdentification: computedConfidence < 0.7,
     ...(computedConfidence < 0.7
       ? {

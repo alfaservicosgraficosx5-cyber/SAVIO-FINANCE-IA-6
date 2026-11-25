@@ -3,6 +3,7 @@ import type {
   CategoryRule,
   CreditCard,
   Direction,
+  EntityId,
   Transaction,
   TransactionStatus,
 } from '../../types';
@@ -24,6 +25,7 @@ import { categorizeTransactionDescription } from '../transactions/Categorization
 import { sanitizeCellForSheet } from '../../utils/sheetGuard';
 import { addMonthsLocal, formatDateBR, todayLocal } from '../../utils/dateUtils';
 import { generateEntityId } from '../common/id';
+import { computeCardImportHash } from './cardImportHash';
 import {
   normalizeCellValueToDate,
   type MappedSpreadsheetRow,
@@ -829,6 +831,8 @@ export interface MappedCardSpreadsheetRow extends MappedSpreadsheetRow {
   cardEntryKind: CardEntryKind;
   installmentCurrent?: number;
   installmentTotal?: number;
+  import_hash?: string;
+  profile?: EntityId;
 }
 
 export function mapSpreadsheetRowsForCard(params: {
@@ -847,7 +851,11 @@ export function mapSpreadsheetRowsForCard(params: {
   const existingKeys = new Set(
     existingTransactions.map((t) => t.idempotencyKey).filter(Boolean) as string[]
   );
+  const existingImportHashes = new Set(
+    cardExisting.map((t) => t.import_hash).filter(Boolean) as string[]
+  );
   const seenInBatch = new Set<string>();
+  const seenHashesInBatch = new Set<string>();
   const dataRows = rows.slice(mapping.headerRowIndex + 1);
   const mapped: MappedCardSpreadsheetRow[] = [];
 
@@ -920,7 +928,7 @@ export function mapSpreadsheetRowsForCard(params: {
       direction = 'EXPENSE';
     }
 
-    const instMatch = description.match(/(\d{1,2})\s*\/\s*(\d{1,2})/);
+    const instMatch = description.match(/(\d{1,2})\s*(?:\/|de)\s*(\d{1,2})/i);
     const instCur = instMatch ? Number(instMatch[1]) : undefined;
     const instTot = instMatch ? Number(instMatch[2]) : undefined;
     if (instTot && instTot > 1 && instCur && instCur <= instTot && cardEntryKind === 'PURCHASE') {
@@ -933,6 +941,7 @@ export function mapSpreadsheetRowsForCard(params: {
       direction,
       customRules: [...categoryRules],
       fallbackCategory: rawCat || 'Cartão',
+      cardId: targetCard.id,
     });
 
     const notes = mapping.notesCol >= 0 ? (row[mapping.notesCol] || '').trim() || undefined : undefined;
@@ -949,7 +958,15 @@ export function mapSpreadsheetRowsForCard(params: {
     const idempotencyKey = externalId
       ? `card-ext-${targetCard.id}-${externalId}`
       : `card-row-${(h >>> 0).toString(16)}`;
+    const importHash = computeCardImportHash({
+      cardId: targetCard.id,
+      date: parsedDate,
+      amountCents: amountCents as number,
+      cleanDescription: description,
+      direction,
+    });
 
+    const dupBySha = existingImportHashes.has(importHash) || seenHashesInBatch.has(importHash);
     const dupByKey = existingKeys.has(idempotencyKey);
     const dupByHeuristic = cardExisting.some(
       (t) =>
@@ -959,8 +976,9 @@ export function mapSpreadsheetRowsForCard(params: {
     );
     const dupInside = seenInBatch.has(idempotencyKey);
     seenInBatch.add(idempotencyKey);
+    seenHashesInBatch.add(importHash);
 
-    const isDuplicate = dupByKey || dupByHeuristic || dupInside;
+    const isDuplicate = dupBySha || dupByKey || dupByHeuristic || dupInside;
     const hasValidationError = amountCents <= 0 || !dateValid;
 
     mapped.push({
@@ -974,6 +992,7 @@ export function mapSpreadsheetRowsForCard(params: {
       amount: fromCents(amountCents),
       direction,
       category: rawCat || autoCat.category || 'Cartão',
+      profile: autoCat.profile || targetCard.entityId,
       operationType: cardEntryKind === 'FEE' ? 'TARIFA' : 'CARTAO',
       cardEntryKind,
       installmentCurrent: instCur,
@@ -981,14 +1000,17 @@ export function mapSpreadsheetRowsForCard(params: {
       notes,
       externalId,
       idempotencyKey,
+      import_hash: importHash,
       isDuplicate,
-      duplicateReason: dupByKey
-        ? 'Registro já importado neste cartão'
-        : dupByHeuristic
-          ? 'Compra equivalente já lançada nesta data/cartão'
-          : dupInside
-            ? 'Linha duplicada nesta planilha'
-            : undefined,
+      duplicateReason: dupBySha
+        ? 'Já importado neste cartão (SHA-256)'
+        : dupByKey
+          ? 'Registro já importado neste cartão'
+          : dupByHeuristic
+            ? 'Compra equivalente já lançada nesta data/cartão'
+            : dupInside
+              ? 'Linha duplicada nesta planilha'
+              : undefined,
       hasValidationError,
       validationError:
         amountCents <= 0
@@ -1019,7 +1041,7 @@ export function buildCardTransactionsFromMappedRows(params: {
       );
       const isPayment = r.cardEntryKind === 'PAYMENT';
       return {
-        entityId: targetCard.entityId,
+        entityId: r.profile || targetCard.entityId,
         accountId: targetCard.id,
         creditCardId: targetCard.id,
         date: r.postingDate || r.date,
@@ -1041,6 +1063,7 @@ export function buildCardTransactionsFromMappedRows(params: {
         operationType: r.operationType,
         importBatchId,
         idempotencyKey: r.idempotencyKey,
+        ...(r.import_hash ? { import_hash: r.import_hash } : {}),
         ...(isPayment ? { isCardBillPayment: true } : {}),
         ...(r.installmentCurrent ? { installmentCurrent: r.installmentCurrent } : {}),
         ...(r.installmentTotal ? { installmentTotal: r.installmentTotal } : {}),

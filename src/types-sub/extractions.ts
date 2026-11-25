@@ -244,10 +244,244 @@ export interface CardPurchaseMeta {
   isInvoicePayment?: boolean;
 }
 
+export type MovementSyncState =
+  | 'NEW'
+  | 'EXISTING'
+  | 'POSSIBLE_DUPLICATE'
+  | 'UPDATED_SOURCE'
+  | 'NEEDS_REVIEW'
+  | 'INVALID';
+
+export type DuplicateLayer = 'NONE' | 'EXATA' | 'PROVAVEL' | 'SUSPEITA' | 'RELACIONADA';
+
+export type DuplicateRelatedKind =
+  | 'COMPRA_E_ESTORNO'
+  | 'PAGAMENTO_E_BAIXA_FATURA'
+  | 'TRANSFERENCIA_PROPRIA'
+  | 'COMPRA_PARCELADA'
+  | 'COMPRA_REPETIDA_ESTABELECIMENTO'
+  | 'CREDITO_DEBITO_CORRESPONDENTE'
+  | 'AJUSTE_SALDO';
+
+export type DuplicateUserDecision =
+  | 'CONFIRM_DUPLICATE'
+  | 'KEEP_BOTH'
+  | 'LINK_MOVEMENTS'
+  | 'IGNORE_ALERT';
+
+export interface DuplicateResolutionRecord {
+  decision: DuplicateUserDecision;
+  decidedAt: string;
+  actor: 'USUARIO';
+  note?: string;
+  linkedTargetId?: string;
+}
+
+export interface ConfidenceBreakdown {
+  ocr?: number;
+  extraction: number;
+  bankDetection: number;
+  accountMatch: number;
+  classification: number;
+  duplication: number;
+}
+
+export type ClassificationRuleOrigin =
+  | 'EXTRACTION_RULE'
+  | 'CUSTOM_RULE'
+  | 'HEURISTIC'
+  | 'USER_OVERRIDE'
+  | 'FALLBACK';
+
+export interface ClassificationRationale {
+  suggestedCategory: string;
+  reason: string;
+  evidence: string;
+  ruleOrigin: ClassificationRuleOrigin;
+  score: number;
+  ruleHistoryCount?: number;
+}
+
+export type AuditSeverity = 'INFO' | 'WARNING' | 'CRITICAL';
+
+export type AuditFindingDomain =
+  | 'STATEMENT'
+  | 'CARD_INVOICE'
+  | 'INSTALLMENT'
+  | 'DUPLICATION'
+  | 'SECURITY'
+  | 'INTEGRITY';
+
+export type AuditActionType =
+  | 'CONFIRM_DUPLICATE'
+  | 'KEEP_BOTH'
+  | 'LINK_MOVEMENTS'
+  | 'IGNORE_ALERT'
+  | 'ACCEPT_SUGGESTION'
+  | 'EDIT_MOVEMENT'
+  | 'REJECT_SUGGESTION'
+  | 'CREATE_RULE'
+  | 'REPROCESS_BATCH'
+  | 'MANUAL_REVIEW';
+
+export interface AuditFinding {
+  id: string;
+  type: string;
+  severity: AuditSeverity;
+  domain: AuditFindingDomain;
+  title: string;
+  amountCents?: MoneyCents;
+  evidence: string;
+  explanation: string;
+  recommendation: string;
+  availableActions: AuditActionType[];
+  targetMovementId?: string;
+  targetTransactionId?: string;
+  resolvedAction?: AuditActionType;
+  resolvedAt?: string;
+  resolvedBy?: string;
+}
+
+export interface InstallmentCommitmentItem {
+  groupId?: string;
+  description: string;
+  merchant: string;
+  cardId?: string;
+  cardName?: string;
+  purchaseDate?: string;
+  totalContractedCents: MoneyCents;
+  installmentAmountCents: MoneyCents;
+  installmentCurrent: number;
+  installmentTotal: number;
+  remainingInstallments: number;
+  committedFutureBalanceCents: MoneyCents;
+  estimatedEndDate?: string;
+  cycleYm?: string;
+  isProjectedAlready: boolean;
+  hasDuplicateRisk: boolean;
+  warnings: string[];
+}
+
+export interface CardInvoiceIntegrityReport {
+  cardId?: string;
+  cardName?: string;
+  dueDate?: string;
+  closingDate?: string;
+  cycleYm?: string;
+  reportedTotalCents: MoneyCents;
+  calculatedNetCents: MoneyCents;
+  purchasesCents: MoneyCents;
+  installmentsCents: MoneyCents;
+  feesAndTaxesCents: MoneyCents;
+  interestAndFinesCents: MoneyCents;
+  reversalsAndCashbackCents: MoneyCents;
+  paymentsCents: MoneyCents;
+  priorBalanceCents: MoneyCents;
+  divergenceCents: MoneyCents;
+  hasDivergence: boolean;
+  installmentSummary: {
+    activePlansCount: number;
+    currentCycleInstallmentsCents: MoneyCents;
+    committedFutureBalanceCents: MoneyCents;
+    items: InstallmentCommitmentItem[];
+  };
+  findings: AuditFinding[];
+}
+
+export interface FinancialIntegrityAuditReport {
+  auditedAt: string;
+  domain: 'STATEMENT' | 'CARD_INVOICE';
+  passed: boolean;
+  blocked: boolean;
+  checklist: Array<{
+    code: string;
+    label: string;
+    passed: boolean;
+    detail?: string;
+  }>;
+  findings: AuditFinding[];
+  cardInvoiceReport?: CardInvoiceIntegrityReport;
+}
+
+export interface IncrementalSyncSummary {
+  totalAnalyzed: number;
+  newCount: number;
+  existingCount: number;
+  possibleDuplicateCount: number;
+  updatedSourceCount: number;
+  needsReviewCount: number;
+  invalidCount: number;
+  reimportedFileDetected: boolean;
+  previousBatchId?: string;
+}
+
+export type AuditLifecycleStatus =
+  | 'UPLOADED'
+  | 'PROCESSING'
+  | 'EXTRACTED'
+  | 'AUDITING'
+  | 'READY_FOR_REVIEW'
+  | 'APPROVED'
+  | 'APPROVED_WITH_WARNINGS'
+  | 'BLOCKED'
+  | 'FAILED'
+  | 'INTEGRATED';
+
+export type ExtractionMethodTag =
+  | 'BANK_DEDICATED_PARSER'
+  | 'LOCAL_PARSER'
+  | 'PDFJS_TEXT'
+  | 'OCR_IA'
+  | 'GOOGLE_SHEETS'
+  | 'GMAIL_ATTACHMENT'
+  | 'MANUAL';
+
+export type ConnectorStatus =
+  | 'DISPONIVEL'
+  | 'CONFIGURADO'
+  | 'AGUARDANDO_AUTORIZACAO'
+  | 'IMPORTACAO_MANUAL'
+  | 'ERRO_CONEXAO'
+  | 'FONTE_NAO_SUPORTADA'
+  | 'DESATIVADO';
+
+export type ConnectorKind =
+  | 'FILE_UPLOAD'
+  | 'CARD_INVOICE'
+  | 'GOOGLE_WORKSPACE'
+  | 'OPEN_FINANCE_CONTRACT';
+
+export interface FinancialConnectorState {
+  id: string;
+  name: string;
+  kind: ConnectorKind;
+  status: ConnectorStatus;
+  acquisitionMethod: string;
+  supportedFormats: string[];
+  accountId?: string;
+  institutionId?: string;
+  lastSyncAt?: string;
+  coveredPeriodStart?: string;
+  coveredPeriodEnd?: string;
+  userAuthorized: boolean;
+  lastError?: string;
+  limitations: string[];
+  updatedAt: string;
+}
+
+export interface BatchCorrectionRecord {
+  timestamp: string;
+  actor: 'USUARIO' | 'SISTEMA';
+  targetMovementId?: string;
+  field: string;
+  detail: string;
+}
+
 export interface ExtractedMovement {
   id: string;
   batchId: string;
   bankTransactionId?: string; // FITID, E2E, NSU, txHash
+  compositeFingerprint?: string;
   institutionName?: string;
   sourceFormat?: ExtractionFileFormat;
   sourceFileName?: string;
@@ -274,11 +508,18 @@ export interface ExtractedMovement {
   matchedRuleId?: string;
   matchedRuleKeyword?: string;
   confidence: number; // 0..1
+  confidenceBreakdown?: ConfidenceBreakdown;
+  classificationRationale?: ClassificationRationale;
   doubtReason?: string;
+  syncState?: MovementSyncState;
+  updatedSourceDiff?: string[];
   duplicateStatus: DuplicateClassification;
+  duplicateLayer?: DuplicateLayer;
+  duplicateRelatedKind?: DuplicateRelatedKind;
   duplicateMatchTxId?: string;
   duplicateMatchBatchId?: string;
   duplicateMatchReason?: string;
+  duplicateResolution?: DuplicateResolutionRecord;
   reviewStatus: ReviewStatus;
   rawRowSnapshot: Record<string, string | number | boolean | null>;
   manualCorrections: string[];
@@ -325,6 +566,7 @@ export interface StatementBalanceSummary {
 
 export interface ExtractionBatch {
   id: string;
+  userId?: string;
   fileName: string;
   format: ExtractionFileFormat;
   fileSizeBytes: number;
@@ -335,6 +577,14 @@ export interface ExtractionBatch {
   periodEnd?: string;
   stage: ExtractionStage;
   status: ExtractionBatchStatus;
+  auditLifecycleStatus?: AuditLifecycleStatus;
+  connectorId?: string;
+  extractionMethod?: ExtractionMethodTag;
+  parserVersion?: string;
+  reimportOfBatchId?: string;
+  incrementalSummary?: IncrementalSyncSummary;
+  integrityAudit?: FinancialIntegrityAuditReport;
+  correctionsHistory?: BatchCorrectionRecord[];
   identifiedAccount: IdentifiedAccountInfo;
   confirmedAccountId?: string;
   confirmedCardId?: string;

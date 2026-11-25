@@ -91,12 +91,16 @@ export function reconcileImportBatch(
   const activeExisting = existingTransactions.filter((t) => t.status !== 'CANCELLED');
 
   const seenIdempotencyKeys = new Set<string>();
+  const seenImportHashes = new Set<string>();
   const seenExternalIds = new Set<string>();
   const seenFingerprints = new Set<string>();
 
   for (const existing of activeExisting) {
     if (existing.idempotencyKey) {
       seenIdempotencyKeys.add(existing.idempotencyKey.trim());
+    }
+    if (existing.import_hash) {
+      seenImportHashes.add(existing.import_hash.trim().toLowerCase());
     }
     if (existing.externalId && existing.externalId.trim()) {
       seenExternalIds.add(existing.externalId.trim().toLowerCase());
@@ -120,6 +124,7 @@ export function reconcileImportBatch(
       amountCents,
       amount: fromCents(amountCents),
     });
+    const importHash = rawItem.import_hash ? rawItem.import_hash.trim().toLowerCase() : '';
     const extClean = (rawItem.externalId || '').trim().toLowerCase();
     const fingerprint = buildImportFingerprint({
       ...rawItem,
@@ -129,6 +134,7 @@ export function reconcileImportBatch(
 
     // Check if an identical confirmed entry or batch duplicate already exists
     const isConfirmedDuplicate =
+      (importHash && seenImportHashes.has(importHash)) ||
       (extClean && seenExternalIds.has(extClean)) ||
       seenFingerprints.has(fingerprint) ||
       (seenIdempotencyKeys.has(idempotencyKey) &&
@@ -153,6 +159,7 @@ export function reconcileImportBatch(
     if (matchedPending) {
       consumedPendingIds.add(matchedPending.id);
       seenIdempotencyKeys.add(idempotencyKey);
+      if (importHash) seenImportHashes.add(importHash);
       if (extClean) seenExternalIds.add(extClean);
       seenFingerprints.add(fingerprint);
 
@@ -164,6 +171,7 @@ export function reconcileImportBatch(
         amount: fromCents(amountCents),
         externalId: rawItem.externalId || matchedPending.externalId,
         idempotencyKey,
+        ...(importHash ? { import_hash: importHash } : {}),
       };
       reconciledTransactions.push(settled);
       reconciledMatches.push({
@@ -174,6 +182,7 @@ export function reconcileImportBatch(
     }
 
     seenIdempotencyKeys.add(idempotencyKey);
+    if (importHash) seenImportHashes.add(importHash);
     if (extClean) seenExternalIds.add(extClean);
     seenFingerprints.add(fingerprint);
 
@@ -183,6 +192,7 @@ export function reconcileImportBatch(
       amountCents,
       amount: fromCents(amountCents),
       idempotencyKey,
+      ...(importHash ? { import_hash: importHash } : {}),
     });
   }
 
